@@ -1,6 +1,6 @@
 [package]
 name = "bitbucket-cli"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A powerful command-line interface for Bitbucket Cloud - manage repos, PRs, issues, and pipelines from your terminal with OAuth 2.0"
@@ -56,6 +56,9 @@ colored = "3"
 tabled = "0.21"
 indicatif = "0.18"
 
+# Profile metadata store
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Utilities
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
@@ -75,6 +78,7 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false }
+tempfile = "3"
 
 [lib]
 name = "bitbucket_cli"

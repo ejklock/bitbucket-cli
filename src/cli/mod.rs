@@ -35,6 +35,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub workspace: Option<String>,
 
+    /// Profile (stored account) to authenticate as; falls back to
+    /// BITBUCKET_PROFILE, then to the only stored profile
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
+
     /// Output format for command results
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
@@ -129,16 +134,52 @@ pub fn set_workspace_override(workspace: Option<String>) {
     let _ = WORKSPACE_OVERRIDE.set(workspace);
 }
 
-fn workspace_override() -> Option<String> {
+pub(crate) fn workspace_override() -> Option<String> {
     WORKSPACE_OVERRIDE.get().cloned().flatten()
 }
 
+static PROFILE_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Record the global `--profile` choice for this process.
+///
+/// `main` must call this once before dispatching a command; the value is
+/// stored in a set-once cell, so any later call is a no-op.
+pub fn set_profile_override(profile: Option<String>) {
+    let _ = PROFILE_OVERRIDE.set(profile);
+}
+
+/// The `--profile` value recorded by [`set_profile_override`], if any.
+pub fn profile_override() -> Option<String> {
+    PROFILE_OVERRIDE.get().cloned().flatten()
+}
+
+/// Workspace precedence: `--workspace`, then the selected profile's default
+/// workspace, then the config file's default.
+fn workspace_chain(
+    flag: Option<String>,
+    profile: impl FnOnce() -> Option<String>,
+    config: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    flag.or_else(|| profile().filter(|w| !w.is_empty()))
+        .or_else(|| config().filter(|w| !w.is_empty()))
+}
+
 fn fallback_workspace() -> Option<String> {
-    workspace_override().or_else(|| {
-        crate::config::Config::load()
-            .ok()
-            .and_then(|c| c.default_workspace().map(String::from))
-    })
+    workspace_chain(
+        workspace_override(),
+        || {
+            crate::auth::AuthManager::new()
+                .and_then(|m| m.selected_metadata())
+                .ok()
+                .flatten()
+                .and_then(|p| p.default_workspace)
+        },
+        || {
+            crate::config::Config::load()
+                .ok()
+                .and_then(|c| c.default_workspace().map(String::from))
+        },
+    )
 }
 
 /// Resolve a workspace given optionally on the command line, falling back to
@@ -347,6 +388,50 @@ mod tests {
     fn resolve_workspace_with_errors_when_nothing_available() {
         assert!(super::resolve_workspace_with(None, None).is_err());
         assert!(super::resolve_workspace_with(None, Some(String::new())).is_err());
+    }
+
+    // Proves: C5 --workspace beats the profile workspace
+    #[test]
+    fn profile_c5_workspace_flag_beats_profile_workspace() {
+        let ws = super::workspace_chain(
+            Some("flag".into()),
+            || Some("profile".into()),
+            || Some("config".into()),
+        );
+        assert_eq!(ws.as_deref(), Some("flag"));
+    }
+
+    // Proves: C5 profile workspace beats the config default
+    #[test]
+    fn profile_c5_profile_workspace_beats_config_default() {
+        let ws = super::workspace_chain(None, || Some("profile".into()), || Some("config".into()));
+        assert_eq!(ws.as_deref(), Some("profile"));
+    }
+
+    // Proves: C5 a profile without workspace falls back to config
+    #[test]
+    fn profile_c5_missing_profile_workspace_falls_back_to_config() {
+        let ws = super::workspace_chain(None, || None, || Some("config".into()));
+        assert_eq!(ws.as_deref(), Some("config"));
+        let ws = super::workspace_chain(None, || Some(String::new()), || Some("config".into()));
+        assert_eq!(ws.as_deref(), Some("config"));
+    }
+
+    // Proves: C11 an empty config workspace counts as absent
+    #[test]
+    fn profile_c11_empty_config_workspace_counts_as_absent() {
+        assert_eq!(
+            super::workspace_chain(None, || None, || Some(String::new())),
+            None
+        );
+        assert_eq!(
+            super::workspace_chain(None, || None, || Some("ws".into())).as_deref(),
+            Some("ws")
+        );
+        assert_eq!(
+            super::workspace_chain(None, || Some(String::new()), || Some("ws".into())).as_deref(),
+            Some("ws")
+        );
     }
 
     // The only test allowed to touch the process-wide override: OnceLock is

@@ -26,6 +26,11 @@ impl FileStore {
         Ok(Self { path })
     }
 
+    /// Credential file at an explicit path (the file need not exist yet).
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
     /// Store credentials in a file
     pub fn store_credential(&self, credential: &Credential) -> Result<()> {
         let json =
