@@ -32,7 +32,12 @@ impl BitbucketClient {
 
     /// Create a client from stored credentials, automatically refreshing if needed
     pub async fn from_stored() -> Result<Self> {
-        let auth_manager = AuthManager::new()?;
+        Self::from_auth_manager(&AuthManager::new()?).await
+    }
+
+    /// Create a client from the credential `auth_manager` selects,
+    /// automatically refreshing if needed
+    pub async fn from_auth_manager(auth_manager: &AuthManager) -> Result<Self> {
         let credential = auth_manager
             .get_credentials()?
             .context("Not authenticated. Run 'bitbucket auth login' first.")?;
@@ -48,7 +53,7 @@ impl BitbucketClient {
             ) = (&credential, credential.oauth_consumer_credentials())
             {
                 let flow = OAuthFlow::new(client_id.to_string(), client_secret.to_string());
-                match flow.refresh_token(&auth_manager, refresh_token).await {
+                match flow.refresh_token(auth_manager, refresh_token).await {
                     Ok(refreshed) => refreshed,
                     Err(e) => {
                         eprintln!("Warning: token refresh failed: {}", e);

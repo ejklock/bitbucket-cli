@@ -120,6 +120,22 @@ You'll need to create an API token:
 
 **Note:** App passwords are deprecated by Atlassian. OAuth 2.0 is the preferred method.
 
+**Several accounts (profiles)**
+
+Each login is stored as a named profile; `auth login` without a name writes the profile `default`, so a single account needs no extra flags.
+
+```bash
+bitbucket --profile work auth login --oauth    # add or replace the "work" profile
+bitbucket --profile work auth login --workspace acme   # also stores acme as its default workspace
+bitbucket auth list                            # name, method, username, workspace (never secrets)
+bitbucket --profile work pr list myrepo        # run any command as "work"
+bitbucket --profile work auth logout           # remove only "work"
+```
+
+The profile is chosen by `--profile <name>`, then the `BITBUCKET_PROFILE` environment variable, then the only stored profile. With several profiles and none chosen, commands fail and list the names. Processes using different profiles never log each other out.
+
+Profile metadata is kept in a SQLite database, `bitbucket.db` in the config directory (override the path with `BITBUCKET_DB`); the credential itself lives in the system keychain (entry `profile:<name>`), and only without a keychain is it stored in the database file. On Linux/BSD with no reachable Secret Service (a headless server, for instance), `auth login` does exactly that: it stores the credential in the database file (mode 0600) and prints a one-line warning; a locked or otherwise failing keyring still fails the login. A credential saved by an earlier version is migrated to the `default` profile on first use.
+
 ### 2. Start Using
 
 ```bash
