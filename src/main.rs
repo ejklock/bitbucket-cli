@@ -11,6 +11,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     cli::set_workspace_override(cli.workspace.clone());
+    cli::set_profile_override(cli.profile.clone());
     cli::set_output_format(cli.output);
 
     let result = match cli.command {

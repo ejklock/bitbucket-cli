@@ -3,7 +3,9 @@ use clap::Subcommand;
 use colored::Colorize;
 use dialoguer::{Input, Select};
 
-use crate::auth::{ApiKeyAuth, AuthManager, OAuthFlow};
+use tabled::{Table, Tabled};
+
+use crate::auth::{ApiKeyAuth, AuthManager, OAuthFlow, Profile, Selection, classify_selection};
 use crate::config::Config;
 
 #[derive(Subcommand)]
@@ -35,11 +37,46 @@ pub enum AuthCommands {
         client_secret: Option<String>,
     },
 
-    /// Remove stored credentials
+    /// Remove the credentials of the selected profile
     Logout,
 
     /// Show authentication status
     Status,
+
+    /// List stored profiles (never prints secrets)
+    List,
+}
+
+/// Row of the `auth list` table.
+#[derive(Tabled)]
+struct ProfileRow {
+    #[tabled(rename = "NAME")]
+    name: String,
+    #[tabled(rename = "METHOD")]
+    method: String,
+    #[tabled(rename = "USERNAME")]
+    username: String,
+    #[tabled(rename = "WORKSPACE")]
+    workspace: String,
+}
+
+impl From<Profile> for ProfileRow {
+    fn from(profile: Profile) -> Self {
+        Self {
+            name: profile.name,
+            method: profile.method,
+            username: profile.username.unwrap_or_default(),
+            workspace: profile.default_workspace.unwrap_or_default(),
+        }
+    }
+}
+
+/// `auth login --workspace W` stores W as the logged-in profile's default workspace.
+fn save_login_workspace(auth_manager: &AuthManager) -> Result<()> {
+    match super::workspace_override() {
+        Some(workspace) if !workspace.is_empty() => auth_manager.set_default_workspace(&workspace),
+        _ => Ok(()),
+    }
 }
 
 impl AuthCommands {
@@ -53,7 +90,7 @@ impl AuthCommands {
                 client_id,
                 client_secret,
             } => {
-                let auth_manager = AuthManager::new()?;
+                let auth_manager = AuthManager::new()?.for_login();
 
                 let use_api_key = resolve_auth_method(
                     oauth,
@@ -64,7 +101,7 @@ impl AuthCommands {
 
                 if use_api_key {
                     ApiKeyAuth::authenticate(&auth_manager, email, token).await?;
-                    return Ok(());
+                    return save_login_workspace(&auth_manager);
                 }
 
                 // OAuth 2.0 authentication.
@@ -119,52 +156,91 @@ impl AuthCommands {
                 let oauth = OAuthFlow::new(client_id, client_secret);
                 oauth.authenticate(&auth_manager).await?;
 
-                Ok(())
+                save_login_workspace(&auth_manager)
             }
 
             AuthCommands::Logout => {
                 let auth_manager = AuthManager::new()?;
-                auth_manager.clear_credentials()?;
+                let (name, others_remain) = auth_manager.clear_credentials()?;
 
-                let mut config = Config::load()?;
-                config.clear_auth();
-                config.save()?;
+                if !others_remain {
+                    let mut config = Config::load()?;
+                    config.clear_auth();
+                    config.save()?;
+                }
 
-                println!("{} Logged out successfully", "✓".green());
+                println!("{} Logged out of profile '{}'", "✓".green(), name);
+                Ok(())
+            }
+
+            AuthCommands::List => {
+                let profiles = AuthManager::new()?.profiles()?;
+
+                if super::output_json() {
+                    return super::print_json(&profiles);
+                }
+
+                if profiles.is_empty() {
+                    println!(
+                        "No profiles. Run {} to add one",
+                        "bitbucket auth login".cyan()
+                    );
+                } else {
+                    let rows: Vec<ProfileRow> = profiles.into_iter().map(Into::into).collect();
+                    println!("{}", Table::new(rows));
+                }
                 Ok(())
             }
 
             AuthCommands::Status => {
                 let auth_manager = AuthManager::new()?;
-                let config = Config::load()?;
+                let selection =
+                    status_selection(&auth_manager.profiles()?, auth_manager.requested())?;
+                if let StatusSelection::Ambiguous(report) = selection {
+                    println!("{}", report);
+                    return Ok(());
+                }
 
-                if auth_manager.is_authenticated() {
+                let config = Config::load()?;
+                let credential = auth_manager.get_credentials()?;
+
+                if let Some(credential) = credential {
                     println!("{} Authenticated", "✓".green());
 
-                    if let Ok(Some(credential)) = auth_manager.get_credentials() {
-                        println!("  {} {}", "Method:".dimmed(), credential.type_name());
+                    let profile = auth_manager.selected_metadata()?;
+                    if let Some(profile) = &profile {
+                        println!("  {} {}", "Profile:".dimmed(), profile.name);
+                    }
+                    println!("  {} {}", "Method:".dimmed(), credential.type_name());
 
-                        // Show username from credential for API keys, or config for OAuth
-                        if let Some(username) = credential.username() {
-                            println!("  {} {}", "Username:".dimmed(), username);
-                        } else if let Some(username) = config.username() {
-                            println!("  {} {}", "Username:".dimmed(), username);
-                        }
-
-                        if credential.needs_refresh() {
-                            println!(
-                                "  {} {}",
-                                "Status:".dimmed(),
-                                "Token needs refresh (will auto-refresh on next use)".yellow()
-                            );
-                        }
+                    // Show username from credential for API keys, or the profile / config for OAuth
+                    if let Some(username) = credential.username() {
+                        println!("  {} {}", "Username:".dimmed(), username);
+                    } else if let Some(username) = profile
+                        .as_ref()
+                        .and_then(|p| p.username.as_deref())
+                        .or(config.username())
+                    {
+                        println!("  {} {}", "Username:".dimmed(), username);
                     }
 
-                    if let Some(workspace) = config.default_workspace() {
+                    if credential.needs_refresh() {
+                        println!(
+                            "  {} {}",
+                            "Status:".dimmed(),
+                            "Token needs refresh (will auto-refresh on next use)".yellow()
+                        );
+                    }
+
+                    if let Some(workspace) = profile
+                        .as_ref()
+                        .and_then(|p| p.default_workspace.as_deref())
+                        .or(config.default_workspace())
+                    {
                         println!("  {} {}", "Workspace:".dimmed(), workspace);
                     }
 
-                    match crate::api::BitbucketClient::from_stored().await {
+                    match crate::api::BitbucketClient::from_auth_manager(&auth_manager).await {
                         Ok(client) => match client.get::<serde_json::Value>("/user").await {
                             Ok(user) => {
                                 if let Some(display_name) = user.get("display_name") {
@@ -193,6 +269,43 @@ impl AuthCommands {
             }
         }
     }
+}
+
+/// What `auth status` should report for the stored profiles.
+#[derive(Debug, PartialEq, Eq)]
+enum StatusSelection {
+    NotAuthenticated,
+    Selected(String),
+    /// Several profiles and none chosen: the text to print instead of a status.
+    Ambiguous(String),
+}
+
+/// Decide what `auth status` reports. An unknown requested name is an error;
+/// with several profiles and no request, the report lists them (never a secret).
+fn status_selection(profiles: &[Profile], requested: Option<&str>) -> Result<StatusSelection> {
+    let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+
+    Ok(match classify_selection(&names, requested)? {
+        Selection::Empty => StatusSelection::NotAuthenticated,
+        Selection::One(name) => StatusSelection::Selected(name),
+        Selection::Ambiguous(_) => StatusSelection::Ambiguous(ambiguous_report(profiles)),
+    })
+}
+
+fn ambiguous_report(profiles: &[Profile]) -> String {
+    let mut report = String::from(
+        "Several profiles are stored; choose one with --profile <name> or BITBUCKET_PROFILE.\n",
+    );
+    for profile in profiles {
+        report.push_str(&format!(
+            "\n  {}\n    Method: {}\n    Username: {}\n    Workspace: {}\n",
+            profile.name,
+            profile.method,
+            profile.username.as_deref().unwrap_or("-"),
+            profile.default_workspace.as_deref().unwrap_or("-"),
+        ));
+    }
+    report
 }
 
 /// Resolve which authentication method to use.
@@ -240,7 +353,67 @@ fn resolve_auth_method(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_auth_method;
+    use super::{StatusSelection, resolve_auth_method, status_selection};
+    use crate::auth::Profile;
+
+    fn profile(name: &str, workspace: Option<&str>) -> Profile {
+        Profile {
+            name: name.to_string(),
+            method: "API Key".to_string(),
+            username: Some(format!("{name}-user")),
+            default_workspace: workspace.map(String::from),
+        }
+    }
+
+    // Proves: C9 several profiles and no choice report all of them with the hint
+    #[test]
+    fn profile_c9_several_profiles_without_choice_are_listed_with_a_hint() {
+        let profiles = [profile("work", Some("acme")), profile("home", None)];
+
+        let StatusSelection::Ambiguous(report) = status_selection(&profiles, None).unwrap() else {
+            panic!("expected the ambiguous report");
+        };
+
+        for expected in [
+            "work",
+            "home",
+            "API Key",
+            "work-user",
+            "home-user",
+            "acme",
+            "--profile",
+            "BITBUCKET_PROFILE",
+        ] {
+            assert!(report.contains(expected), "{expected} missing in {report}");
+        }
+    }
+
+    // Proves: C9 unknown requested name errors, naming it
+    #[test]
+    fn profile_c9_unknown_requested_profile_errors() {
+        let profiles = [profile("work", None)];
+        let message = status_selection(&profiles, Some("ghost"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("ghost"), "{message}");
+    }
+
+    // Proves: C9 zero profiles is not authenticated, one is selected
+    #[test]
+    fn profile_c9_zero_profiles_is_unauthenticated_and_one_is_selected() {
+        assert_eq!(
+            status_selection(&[], None).unwrap(),
+            StatusSelection::NotAuthenticated
+        );
+        assert_eq!(
+            status_selection(&[profile("solo", None)], None).unwrap(),
+            StatusSelection::Selected("solo".to_string())
+        );
+        assert_eq!(
+            status_selection(&[profile("a", None), profile("b", None)], Some("b")).unwrap(),
+            StatusSelection::Selected("b".to_string())
+        );
+    }
 
     #[test]
     fn explicit_api_key_flag_selects_api_key() {

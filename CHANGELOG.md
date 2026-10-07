@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Named auth profiles: several Bitbucket accounts coexist, chosen per command by
+  the global `--profile <name>` flag, then `BITBUCKET_PROFILE`, then the only
+  stored profile. `auth list` shows name, method, username and workspace
+  (`--output json` supported); `auth status` shows the active profile;
+  `auth login --workspace W` stores W as the profile's default workspace, and
+  that default sits between `--workspace` and the config default.
+  Profile metadata lives in `bitbucket.db` in the config directory
+  (`BITBUCKET_DB` overrides the path); secrets stay in the system keychain. On Linux/BSD with no reachable Secret
+  Service, `auth login` stores the secret in the database row (mode 0600) with a
+  one-line warning instead of failing; macOS, Windows and every other keyring
+  error still fail loudly.
+
+### Changed
+
+- `auth logout` removes only the selected profile. A credential saved by an
+  earlier version is migrated to the profile `default` on first use, and the
+  plain-text `credentials.json` fallback is replaced by the database.
+
 ## [1.1.0] - 2026-08-31
 
 ### Added
