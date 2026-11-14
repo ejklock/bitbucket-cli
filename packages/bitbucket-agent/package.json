@@ -1,0 +1,21 @@
+{
+  "name": "bitbucket-agent",
+  "version": "1.2.1",
+  "description": "Bitbucket for AI coding agents: gives OpenCode the bitbucket MCP server and the bitbucket skill, and Pi the bitbucket skill",
+  "license": "MIT",
+  "author": "Evaldo Klock",
+  "repository": { "type": "git", "url": "git+https://github.com/ejklock/bitbucket-cli.git", "directory": "packages/bitbucket-agent" },
+  "homepage": "https://github.com/ejklock/bitbucket-cli",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./index.ts"
+  },
+  "keywords": ["pi-package", "opencode", "opencode-plugin", "bitbucket", "mcp", "model-context-protocol", "ai-agent", "skill", "pull-requests", "pipelines"],
+  "pi": { "skills": ["skills"] },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": ["index.ts", "skills", "README.md"]
+}

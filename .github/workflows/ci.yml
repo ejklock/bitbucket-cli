@@ -12,6 +12,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  plugins:
+    name: Plugin packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          # node --test runs the OpenCode plugin's .ts without a build, which needs type stripping (Node 22.18+).
+          node-version: 24
+      - run: sh tests/check_skill_copies_test.sh
+      - run: sh scripts/check-skill-copies.sh
+      - run: node --test packages/bitbucket-agent/
+
   check:
     name: Check
     runs-on: ubuntu-latest
