@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-14
+
+### Added
+
+- `bitbucket mcp` serves the CLI as MCP tools over stdio for AI agents:
+  `bitbucket_read` (read-only: `pr_list`, `pr_view`, `pr_diff`,
+  `pr_diffstat`, `pr_commits`, `pr_statuses`, `pr_activity`,
+  `pr_list_comments`, `pr_view_comment`, `pr_pipelines`, `pipeline_list`,
+  `pipeline_view`, `repo_list`, `repo_view`) and `bitbucket_write`
+  (destructive: `pr_create`, `pr_edit`, `pr_comment`, `pr_approve`,
+  `pr_unapprove`, `pr_request_changes`, `pr_merge`, `pr_decline`,
+  `pipeline_trigger`, `pipeline_stop`, `pipeline_rerun`). Both accept an
+  optional `profile` and `workspace`. Each call runs the binary itself with
+  `--output json`.
+- Plugins: install from this repository's marketplace in Claude Code
+  (`claude plugin marketplace add ejklock/bitbucket-cli`, then
+  `claude plugin install bitbucket@bitbucket`) and Codex; the npm package
+  `bitbucket-agent` adds the MCP server and the skill to OpenCode and the
+  skill to Pi.
+- `install.sh` (Linux and macOS, amd64 and arm64) and `install.ps1`
+  (Windows x64) install the binary from this fork's GitHub releases.
+
+### Fixed
+
+- The release PKGBUILD and APKBUILD build this fork at the current version;
+  they built the upstream project's 1.0.1 before. The MSI carries the
+  current version instead of 1.0.1.
+- Debug builds no longer overflow the 1 MiB main-thread stack on Windows:
+  the CLI runs on a thread with an 8 MiB stack.
+
+### Changed
+
+- README and crate metadata present this fork (repository, homepage,
+  documentation, keywords), crediting the upstream
+  [quinnjr/bitbucket-cli](https://github.com/quinnjr/bitbucket-cli).
+  `cargo install bitbucket-cli` installs the upstream crate; install this
+  fork from its releases or with
+  `cargo install --git https://github.com/ejklock/bitbucket-cli`.
+
 ## [1.2.1] - 2026-10-07
 
 ### Fixed

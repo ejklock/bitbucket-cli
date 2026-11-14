@@ -1,86 +1,78 @@
 # Bitbucket CLI
 
-[![CI](https://github.com/quinnjr/bitbucket-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/quinnjr/bitbucket-cli/actions/workflows/ci.yml)
-[![Release](https://github.com/quinnjr/bitbucket-cli/actions/workflows/release.yml/badge.svg)](https://github.com/quinnjr/bitbucket-cli/releases)
-[![Crates.io](https://img.shields.io/crates/v/bitbucket-cli.svg)](https://crates.io/crates/bitbucket-cli)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+A command-line interface and terminal UI for Bitbucket Cloud, with an MCP server so AI agents can work with your pull requests and pipelines.
 
-A powerful command-line interface for Bitbucket Cloud. Manage repositories, pull requests, issues, and pipelines directly from your terminal.
+[![CI](https://github.com/ejklock/bitbucket-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/ejklock/bitbucket-cli/actions/workflows/ci.yml)
+[![Release](https://github.com/ejklock/bitbucket-cli/actions/workflows/release.yml/badge.svg)](https://github.com/ejklock/bitbucket-cli/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## ✨ Features
+This is a fork of [quinnjr/bitbucket-cli](https://github.com/quinnjr/bitbucket-cli), maintained at [ejklock/bitbucket-cli](https://github.com/ejklock/bitbucket-cli). It adds multi-account profiles, an MCP server and agent plugins, and is installed from this repository's releases.
 
-- 📁 **Repository Management** - List, view, clone, create, manage repositories, and upload/manage downloads
-- 🔀 **Pull Requests** - Create, review, merge, approve, and manage PRs
-- 🐛 **Issue Tracking** - Create, view, comment on, and manage issues
-- ⚡ **Pipelines** - Trigger, monitor, and manage CI/CD pipelines
-- 🖥️ **Interactive TUI** - Beautiful terminal UI for browsing and managing resources
-- 🔐 **Secure Authentication** - OAuth 2.0 preferred, API key fallback, with secure keyring storage
+## Features
 
-## 📦 Installation
+- **Repository Management** - List, view, clone, create, manage repositories, and upload/manage downloads
+- **Pull Requests** - Create, review, merge, approve, and manage PRs
+- **Issue Tracking** - Create, view, comment on, and manage issues
+- **Pipelines** - Trigger, monitor, and manage CI/CD pipelines
+- **Interactive TUI** - Terminal UI for browsing and managing resources
+- **Multi-account profiles** - Store several logins as named profiles and pick one per command with `--profile`
+- **MCP server** - `bitbucket mcp` exposes pull request, pipeline and repository operations to any MCP client
+- **Agent plugins** - One-step installs for Claude Code, Codex, OpenCode and Pi
+- **Secure Authentication** - OAuth 2.0 preferred, API key fallback, with secure keyring storage
 
-### Using Cargo (Recommended)
+## Installation
+
+The crate named `bitbucket-cli` on crates.io belongs to the upstream project, so `cargo install bitbucket-cli` installs the upstream, without this fork's profiles. Install this fork from its releases.
+
+### Linux and macOS
 
 ```bash
-cargo install bitbucket-cli
+curl -fsSL https://raw.githubusercontent.com/ejklock/bitbucket-cli/HEAD/install.sh | sh
 ```
+
+The script downloads the binary for your platform (Linux or macOS, amd64 or arm64) from the latest release and installs it to `~/.local/bin` (override with `BITBUCKET_INSTALL_DIR`). Pass a release tag to pin a version: `... | sh -s -- v1.2.1`.
+
+### Windows
+
+```powershell
+irm https://raw.githubusercontent.com/ejklock/bitbucket-cli/HEAD/install.ps1 | iex
+```
+
+This installs `bitbucket.exe` to `%LOCALAPPDATA%\Programs\bitbucket` and adds it to your user `PATH`. The `.msi` installer from the [Releases](https://github.com/ejklock/bitbucket-cli/releases) page is an alternative.
 
 ### Debian/Ubuntu
 
 ```bash
-# Download the .deb package from releases
-wget https://github.com/quinnjr/bitbucket-cli/releases/latest/download/bitbucket-cli_amd64.deb
+wget https://github.com/ejklock/bitbucket-cli/releases/latest/download/bitbucket-cli_amd64.deb
 sudo dpkg -i bitbucket-cli_amd64.deb
-```
-
-### Red Hat/Fedora/CentOS
-
-```bash
-# Download the .rpm package from releases
-wget https://github.com/quinnjr/bitbucket-cli/releases/latest/download/bitbucket-cli.x86_64.rpm
-sudo rpm -i bitbucket-cli.x86_64.rpm
-# or with dnf
-sudo dnf install bitbucket-cli.x86_64.rpm
 ```
 
 ### Arch Linux
 
 ```bash
-# Recommended: download the PKGBUILD from releases and build the package
-wget https://github.com/quinnjr/bitbucket-cli/releases/latest/download/PKGBUILD
+wget https://github.com/ejklock/bitbucket-cli/releases/latest/download/PKGBUILD
 makepkg -si
-
-# Or download the binary tarball and extract it manually
-wget https://github.com/quinnjr/bitbucket-cli/releases/latest/download/bitbucket-cli-vX.X.X-x86_64-linux.tar.zst
-tar --zstd -xf bitbucket-cli-vX.X.X-x86_64-linux.tar.zst
-sudo mv bitbucket /usr/local/bin/
 ```
 
 ### Alpine Linux
 
-```bash
-# Download the tarball from releases
-wget https://github.com/quinnjr/bitbucket-cli/releases/latest/download/bitbucket-cli-vX.X.X-alpine-x86_64.tar.gz
-tar -xzf bitbucket-cli-vX.X.X-alpine-x86_64.tar.gz
-sudo mv bitbucket /usr/local/bin/
-```
-
-### Windows
-
-Download the MSI installer from the [Releases](https://github.com/quinnjr/bitbucket-cli/releases) page and run it.
+The release carries an `APKBUILD` and an Alpine tarball (`bitbucket-cli-vX.X.X-alpine-x86_64.tar.gz`); see the [Releases](https://github.com/ejklock/bitbucket-cli/releases) page.
 
 ### From Source
 
 ```bash
-git clone https://github.com/quinnjr/bitbucket-cli.git
+cargo install --git https://github.com/ejklock/bitbucket-cli
+```
+
+or from a clone:
+
+```bash
+git clone https://github.com/ejklock/bitbucket-cli.git
 cd bitbucket-cli
 cargo install --path .
 ```
 
-### Pre-built Binaries
-
-Download pre-built binaries for your platform from the [Releases](https://github.com/quinnjr/bitbucket-cli/releases) page.
-
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Authenticate
 
@@ -201,6 +193,61 @@ bitbucket tui
 - `Enter` - Select (opens the view on Dashboard)
 - `r` - Refresh
 
+## AI agents
+
+Three ways to give an AI coding agent your Bitbucket pull requests, pipelines and repositories:
+
+| Way | Harnesses | What the agent gets |
+|---|---|---|
+| CLI | Any agent with a shell | The `bitbucket` commands, with `--output json` for scripting |
+| [MCP server](#mcp-server) | Any MCP client | The `bitbucket_read` and `bitbucket_write` tools |
+| [Plugins](#plugins) | Claude Code, Codex, OpenCode, Pi | The MCP server wired in with one install step |
+
+All three need `bitbucket` installed first ([Installation](#installation)) and `bitbucket auth login` run once. The MCP server and the plugins are not in the releases published before they were added: they need the next release or later.
+
+### Plugins
+
+Each plugin starts the `bitbucket` found on your `PATH`.
+
+```sh
+# Claude Code
+claude plugin marketplace add ejklock/bitbucket-cli
+claude plugin install bitbucket@bitbucket
+
+# Codex
+codex plugin marketplace add ejklock/bitbucket-cli
+codex plugin add bitbucket@bitbucket
+```
+
+OpenCode: add the package to the `plugin` list in `opencode.json`:
+
+```json
+{ "plugin": ["bitbucket-agent"] }
+```
+
+Pi:
+
+```sh
+pi install npm:bitbucket-agent
+```
+
+### MCP server
+
+`bitbucket mcp` serves Bitbucket operations as MCP tools over stdio. Register it in any MCP client with the command `bitbucket` and the argument `mcp`:
+
+```json
+{ "mcpServers": { "bitbucket": { "command": "bitbucket", "args": ["mcp"] } } }
+```
+
+Two tools, each taking an `operation` plus its arguments, and an optional `profile` and `workspace` (the profile defaults as for the CLI, see "Several accounts" above):
+
+| Tool | Operations |
+|---|---|
+| `bitbucket_read` | `pr_list`, `pr_view`, `pr_diff`, `pr_diffstat`, `pr_commits`, `pr_statuses`, `pr_activity`, `pr_list_comments`, `pr_view_comment`, `pr_pipelines`, `pipeline_list`, `pipeline_view`, `repo_list`, `repo_view` |
+| `bitbucket_write` | `pr_create`, `pr_edit`, `pr_comment`, `pr_approve`, `pr_unapprove`, `pr_request_changes`, `pr_merge`, `pr_decline`, `pipeline_trigger`, `pipeline_stop`, `pipeline_rerun` |
+
+Write operations act with the permissions of the chosen profile, as the CLI commands do.
+
 ## ⚙️ Configuration
 
 Configuration is stored in `~/.config/bitbucket-cli/config.toml`:
@@ -217,11 +264,7 @@ pager = true
 
 `[defaults] workspace` is still read as a legacy fallback for the default workspace; `[auth] default_workspace` takes precedence.
 
-## 📚 Documentation
-
-Full documentation is available at [quinnjr.github.io/bitbucket-cli](https://quinnjr.github.io/bitbucket-cli/)
-
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details.
 
@@ -231,19 +274,10 @@ Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 💖 Support
+## Credits
 
-If you find this project useful, please consider:
-
-- ⭐ Starring the repository
-- 🐛 Reporting bugs
-- 💡 Suggesting features
-- 💰 [Supporting the project](https://quinnjr.dev)
-
----
-
-Made with ❤️ by [quinnjr](https://quinnjr.dev)
+Forked from [quinnjr/bitbucket-cli](https://github.com/quinnjr/bitbucket-cli) by quinnjr; the original commands, TUI and authentication are theirs.
