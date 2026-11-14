@@ -1,0 +1,13 @@
+{
+  "name": "bitbucket",
+  "description": "Work with Bitbucket Cloud pull requests, comments, pipelines and repositories through the bitbucket CLI: the bitbucket MCP server and the bitbucket skill.",
+  "owner": {
+    "name": "Evaldo Klock"
+  },
+  "plugins": [
+    {
+      "name": "bitbucket",
+      "source": "./plugins/bitbucket"
+    }
+  ]
+}

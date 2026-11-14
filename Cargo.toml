@@ -3,14 +3,14 @@ name = "bitbucket-cli"
 version = "1.2.1"
 edition = "2024"
 rust-version = "1.85"
-description = "A powerful command-line interface for Bitbucket Cloud - manage repos, PRs, issues, and pipelines from your terminal with OAuth 2.0"
-authors = ["quinnjr"]
+description = "Command-line interface, TUI and MCP server for Bitbucket Cloud: repositories, pull requests, issues and pipelines, with multi-account profiles"
+authors = ["Evaldo Klock", "quinnjr"]
 license = "MIT"
-repository = "https://github.com/quinnjr/bitbucket-cli"
-homepage = "https://github.com/quinnjr/bitbucket-cli"
-documentation = "https://quinnjr.github.io/bitbucket-cli/"
+repository = "https://github.com/ejklock/bitbucket-cli"
+homepage = "https://github.com/ejklock/bitbucket-cli"
+documentation = "https://github.com/ejklock/bitbucket-cli#readme"
 readme = "README.md"
-keywords = ["bitbucket", "cli", "git", "devtools", "tui"]
+keywords = ["bitbucket", "cli", "tui", "mcp", "devtools"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
     "docs/",
@@ -67,6 +67,10 @@ dialoguer = "0.12"
 rpassword = "7"
 url = "2"
 
+# MCP server
+rmcp = { version = "3.9.0", features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
@@ -79,6 +83,7 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false }
 tempfile = "3"
+rmcp = { version = "3.9.0", features = ["client", "transport-child-process"] }
 
 [lib]
 name = "bitbucket_cli"
@@ -100,7 +105,7 @@ codegen-units = 1
 
 # Debian package configuration
 [package.metadata.deb]
-maintainer = "quinnjr"
+maintainer = "Evaldo Klock"
 copyright = "2025-2026, Joseph Quinn <quinn.josephr@proton.me>"
 license-file = ["LICENSE", "4"]
 extended-description = """\
