@@ -323,3 +323,23 @@ mod stub_child {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn help_runs_within_a_one_mebibyte_main_stack() {
+    let output = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "ulimit -s 1024 && exec \"$0\" --help",
+            env!("CARGO_BIN_EXE_bitbucket"),
+        ])
+        .output()
+        .expect("run the binary under a 1 MiB stack");
+    assert!(
+        output.status.success(),
+        "status {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("mcp"));
+}

@@ -6,22 +6,41 @@ use colored::Colorize;
 
 use cli::{Cli, Commands};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+/// Stack size of the worker thread that parses arguments and runs the command.
+///
+/// Debug builds of the derived command tree need more than the 1 MiB main
+/// thread stack Windows gives a process, so the work runs on its own thread.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() {
+    let worker = std::thread::Builder::new()
+        .name("bitbucket-main".into())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(run)
+        .expect("failed to spawn the worker thread");
+
+    match worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            report_error(&e);
+            std::process::exit(1);
+        }
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Parse the command line, build the runtime and run the chosen subcommand.
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     cli::set_workspace_override(cli.workspace.clone());
     cli::set_profile_override(cli.profile.clone());
     cli::set_output_format(cli.output);
 
-    let result = dispatch(cli.command, cli.workspace).await;
-
-    if let Err(e) = result {
-        report_error(&e);
-        std::process::exit(1);
-    }
-
-    Ok(())
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(dispatch(cli.command, cli.workspace))
 }
 
 /// Run the chosen subcommand.
