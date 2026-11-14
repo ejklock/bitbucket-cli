@@ -100,6 +100,9 @@ pub enum Commands {
 
     /// Launch interactive TUI
     Tui,
+
+    /// Serve pull request, pipeline and repository commands over MCP (stdio)
+    Mcp,
 }
 
 static OUTPUT_FORMAT: OnceLock<OutputFormat> = OnceLock::new();
