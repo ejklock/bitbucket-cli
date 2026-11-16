@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The CLI exits as soon as its command returns instead of waiting for a
+  pending standard-input read, which could hold `bitbucket mcp` open after an
+  error until the next input line or end of input.
+
 ## [1.3.0] - 2026-11-14
 
 ### Added
