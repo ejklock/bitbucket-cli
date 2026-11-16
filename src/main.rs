@@ -37,10 +37,21 @@ fn run() -> Result<()> {
     cli::set_profile_override(cli.profile.clone());
     cli::set_output_format(cli.output);
 
-    tokio::runtime::Builder::new_current_thread()
+    block_on_detached(dispatch(cli.command, cli.workspace))
+}
+
+/// Run `future` to completion on a current-thread runtime, then shut the
+/// runtime down without waiting for blocking-pool work, which is abandoned.
+///
+/// A pending `tokio::io::stdin()` read cannot be cancelled, so waiting for it
+/// would hold the process open until the next input line or EOF.
+fn block_on_detached<F: std::future::Future<Output = Result<()>>>(future: F) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
-        .block_on(dispatch(cli.command, cli.workspace))
+        .build()?;
+    let result = runtime.block_on(future);
+    runtime.shutdown_background();
+    result
 }
 
 /// Run the chosen subcommand.
@@ -70,4 +81,45 @@ fn report_error(error: &anyhow::Error) {
         .filter(|c| !c.is_control() || *c == '\n')
         .collect();
     eprintln!("{} {}", "Error:".red().bold(), message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn sleeper() {
+        drop(tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_secs(10));
+        }));
+    }
+
+    #[test]
+    fn block_on_detached_returns_the_error_without_waiting_for_blocking_work() {
+        let start = Instant::now();
+        let result = block_on_detached(async {
+            sleeper();
+            Err(anyhow::anyhow!("boom"))
+        });
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(result.unwrap_err().to_string(), "boom");
+    }
+
+    #[test]
+    fn block_on_detached_returns_ok_without_waiting_for_blocking_work() {
+        let start = Instant::now();
+        let result = block_on_detached(async {
+            sleeper();
+            Ok(())
+        });
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn block_on_detached_passes_results_through_unchanged() {
+        assert!(block_on_detached(async { Ok(()) }).is_ok());
+        let err = block_on_detached(async { Err(anyhow::anyhow!("plain failure")) });
+        assert_eq!(err.unwrap_err().to_string(), "plain failure");
+    }
 }
