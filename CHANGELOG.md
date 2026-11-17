@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The macOS release assets `bitbucket-darwin-arm64.tar.gz` and
+  `bitbucket-darwin-amd64.tar.gz` now hold the same universal binary
+  (Apple silicon and Intel), built by one macOS job instead of two.
+
 ## [1.3.1] - 2026-11-16
 
 ### Fixed
