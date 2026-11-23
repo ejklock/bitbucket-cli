@@ -1,6 +1,6 @@
 [package]
 name = "bitbucket-cli"
-version = "1.3.2"
+version = "1.3.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Command-line interface, TUI and MCP server for Bitbucket Cloud: repositories, pull requests, issues and pipelines, with multi-account profiles"
