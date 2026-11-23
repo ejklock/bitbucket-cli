@@ -87,7 +87,7 @@ jobs:
           lipo -create -output target/universal-apple-darwin/release/${{ matrix.artifact_name }} \
             target/aarch64-apple-darwin/release/${{ matrix.artifact_name }} \
             target/x86_64-apple-darwin/release/${{ matrix.artifact_name }}
-          lipo -verify_arch target/universal-apple-darwin/release/${{ matrix.artifact_name }} arm64 x86_64
+          lipo target/universal-apple-darwin/release/${{ matrix.artifact_name }} -verify_arch arm64 x86_64
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
