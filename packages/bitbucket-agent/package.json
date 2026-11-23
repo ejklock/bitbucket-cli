@@ -1,6 +1,6 @@
 {
   "name": "bitbucket-agent",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Bitbucket for AI coding agents: gives OpenCode the bitbucket MCP server and the bitbucket skill, and Pi the bitbucket skill",
   "license": "MIT",
   "author": "Evaldo Klock",
