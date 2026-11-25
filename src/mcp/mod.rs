@@ -5,6 +5,7 @@
 //! protocol stream on stdout.
 
 mod calls;
+mod schema;
 mod skills;
 
 use std::borrow::Cow;
@@ -14,7 +15,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use calls::{ChildRunner, HEARTBEAT, Relay};
-use rmcp::handler::server::common::{schema_for_empty_input, schema_for_input};
 use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
@@ -28,7 +28,7 @@ use rmcp::service::RequestContext;
 use rmcp::task_manager::TaskManager;
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, tool_router};
-use serde_json::{Value, json};
+use serde_json::Value;
 use skills::SkillCatalog;
 
 /// Operations of the read-only tool, each the `bitbucket` subcommand of the
@@ -68,7 +68,7 @@ pub const WRITE_OPERATIONS: &[&str] = &[
 /// The fields of a tool call. One flat object serves every operation of a
 /// tool: Claude drops a tool whose input schema is a top-level `oneOf`.
 /// A field an operation does not take is ignored.
-#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
     /// The command to run.
@@ -214,18 +214,46 @@ pub fn build_argv(tool: ToolKind, arguments: &Arguments) -> Result<Vec<String>, 
     Ok(call.argv)
 }
 
+/// The kind of value a field carries, which fixes its published JSON type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Number,
+    Switch,
+    Texts,
+}
+
 /// One argument an operation takes: appends itself to the call's argument
-/// vector, or rejects the call.
-type Field = Box<dyn Fn(&mut Call) -> Step + Send + Sync>;
+/// vector, or rejects the call. `name` is the published field it reads, absent
+/// for a check that reads none.
+struct Field {
+    name: Option<&'static str>,
+    kind: Kind,
+    apply: Box<dyn Fn(&mut Call) -> Step + Send + Sync>,
+}
+
+impl Field {
+    fn new(
+        name: &'static str,
+        kind: Kind,
+        apply: impl Fn(&mut Call) -> Step + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: Some(name),
+            kind,
+            apply: Box::new(apply),
+        }
+    }
+}
 
 /// The `repo` positional.
 fn repo() -> Field {
-    Box::new(|call| call.repo())
+    Field::new("repo", Kind::Text, |call| call.repo())
 }
 
 /// A required numeric positional.
 fn positional(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Number, move |call| {
         call.argv
             .push(required(name, get(call.arguments))?.to_string());
         Ok(())
@@ -234,22 +262,28 @@ fn positional(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
 
 /// An optional `--flag=value`.
 fn text(name: &'static str, get: fn(&Arguments) -> &Option<String>) -> Field {
-    Box::new(move |call| call.text(name, get(call.arguments)))
+    Field::new(name, Kind::Text, move |call| {
+        call.text(name, get(call.arguments))
+    })
 }
 
 /// A required `--flag=value`.
 fn required_text(name: &'static str, get: fn(&Arguments) -> &Option<String>) -> Field {
-    Box::new(move |call| call.required_text(name, get(call.arguments)))
+    Field::new(name, Kind::Text, move |call| {
+        call.required_text(name, get(call.arguments))
+    })
 }
 
 /// A repeated `--flag=value`.
 fn texts(name: &'static str, get: fn(&Arguments) -> &[String]) -> Field {
-    Box::new(move |call| call.texts(name, get(call.arguments)))
+    Field::new(name, Kind::Texts, move |call| {
+        call.texts(name, get(call.arguments))
+    })
 }
 
 /// An optional numeric `--flag=value`.
 fn number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Number, move |call| {
         call.number(name, get(call.arguments));
         Ok(())
     })
@@ -257,7 +291,7 @@ fn number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
 
 /// A required numeric `--flag=value`.
 fn required_number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Number, move |call| {
         call.number(name, Some(required(name, get(call.arguments))?));
         Ok(())
     })
@@ -265,7 +299,7 @@ fn required_number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Fi
 
 /// A `--flag` present only when on.
 fn switch(name: &'static str, get: fn(&Arguments) -> bool) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Switch, move |call| {
         call.switch(name, get(call.arguments));
         Ok(())
     })
@@ -273,12 +307,16 @@ fn switch(name: &'static str, get: fn(&Arguments) -> bool) -> Field {
 
 /// Rejects a call with neither `build` nor `uuid`.
 fn build_or_uuid() -> Field {
-    Box::new(|call| {
-        if call.arguments.build.is_none() && call.arguments.uuid.is_none() {
-            return Err("`build` or `uuid` is required".to_owned());
-        }
-        Ok(())
-    })
+    Field {
+        name: None,
+        kind: Kind::Text,
+        apply: Box::new(|call| {
+            if call.arguments.build.is_none() && call.arguments.uuid.is_none() {
+                return Err("`build` or `uuid` is required".to_owned());
+            }
+            Ok(())
+        }),
+    }
 }
 
 fn id() -> Field {
@@ -460,7 +498,7 @@ impl Call<'_> {
         let Some((_, fields)) = OPERATIONS.iter().find(|(name, _)| *name == operation) else {
             return Err(format!("unsupported `operation` {operation:?}"));
         };
-        fields.iter().try_for_each(|field| field(self))
+        fields.iter().try_for_each(|field| (field.apply)(self))
     }
 
     /// The `repo` positional, `workspace/repo-slug`.
@@ -603,10 +641,8 @@ impl BitbucketServer {
 #[tool_router]
 impl BitbucketServer {
     #[tool(
-        description = "Read Bitbucket Cloud data (pull requests, pipelines, repositories) as \
-                       the `bitbucket --output json` commands print it. Select the command \
-                       with `operation`.",
-        input_schema = input_schema(ToolKind::Read),
+        description = "Read Bitbucket Cloud data. Arguments per operation: skill://bitbucket/SKILL.md.",
+        input_schema = schema::input_schema(ToolKind::Read),
         annotations(read_only_hint = true)
     )]
     async fn bitbucket_read(
@@ -618,10 +654,8 @@ impl BitbucketServer {
     }
 
     #[tool(
-        description = "Change Bitbucket Cloud data (create, edit, comment on, approve, merge or \
-                       decline a pull request; trigger, stop or rerun a pipeline). Select the \
-                       command with `operation`.",
-        input_schema = input_schema(ToolKind::Write),
+        description = "Change Bitbucket Cloud data. Arguments per operation: skill://bitbucket/SKILL.md.",
+        input_schema = schema::input_schema(ToolKind::Write),
         annotations(destructive_hint = true, read_only_hint = false)
     )]
     async fn bitbucket_write(
@@ -790,29 +824,6 @@ impl ServerHandler for BitbucketServer {
             None,
         ))
     }
-}
-
-/// The published input schema of a tool: the derived flat object with
-/// `operation` narrowed to the operations of that tool.
-fn input_schema(tool: ToolKind) -> Arc<JsonObject> {
-    let operations = match tool {
-        ToolKind::Read => READ_OPERATIONS,
-        ToolKind::Write => WRITE_OPERATIONS,
-    };
-    let mut schema = schema_for_input::<Arguments>().unwrap_or_else(|_| schema_for_empty_input());
-    let flat = Arc::make_mut(&mut schema);
-    if let Some(Value::Object(properties)) = flat.get_mut("properties") {
-        properties.insert(
-            "operation".to_owned(),
-            json!({
-                "type": "string",
-                "enum": operations,
-                "description": "The command to run."
-            }),
-        );
-    }
-    flat.insert("required".to_owned(), json!(["operation"]));
-    schema
 }
 
 /// A failed call: the message becomes an `isError` result.

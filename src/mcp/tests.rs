@@ -1,6 +1,7 @@
 use super::*;
 use crate::cli::{Cli, Commands, pr::PrCommands};
 use clap::Parser;
+use serde_json::json;
 
 fn call(operation: &str) -> Arguments {
     Arguments {
@@ -420,4 +421,101 @@ fn long_call_short_operations_are_never_long() {
         &limited("pipeline_stop", Some(500))
     ));
     assert!(!is_long_call(ToolKind::Read, &call("no_such_operation")));
+}
+
+fn published(tool: ToolKind) -> serde_json::Map<String, Value> {
+    let schema = schema::input_schema(tool);
+    match schema.get("properties") {
+        Some(Value::Object(properties)) => properties.clone(),
+        other => panic!("no properties object: {other:?}"),
+    }
+}
+
+fn names(properties: &serde_json::Map<String, Value>) -> std::collections::BTreeSet<String> {
+    properties.keys().cloned().collect()
+}
+
+fn fields_of(operations: &[&str]) -> std::collections::BTreeSet<String> {
+    let mut set: std::collections::BTreeSet<String> = ["operation", "profile", "workspace"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for (name, fields) in OPERATIONS.iter() {
+        if operations.contains(name) {
+            set.extend(fields.iter().filter_map(|f| f.name).map(str::to_owned));
+        }
+    }
+    set
+}
+
+#[test]
+fn schema_each_tool_publishes_exactly_the_fields_of_its_operations() {
+    assert_eq!(
+        names(&published(ToolKind::Read)),
+        fields_of(READ_OPERATIONS)
+    );
+    assert_eq!(
+        names(&published(ToolKind::Write)),
+        fields_of(WRITE_OPERATIONS)
+    );
+}
+
+#[test]
+fn schema_every_operation_has_a_table_entry() {
+    for name in READ_OPERATIONS.iter().chain(WRITE_OPERATIONS) {
+        assert!(OPERATIONS.iter().any(|(op, _)| op == name), "{name}");
+    }
+}
+
+#[test]
+fn schema_fields_are_split_between_the_tools() {
+    let read = names(&published(ToolKind::Read));
+    let write = names(&published(ToolKind::Write));
+    for field in ["state", "logs", "scan_limit", "build"] {
+        assert!(read.contains(field), "read lacks {field}");
+    }
+    for field in ["title", "body", "wait"] {
+        assert!(!read.contains(field), "read has {field}");
+    }
+    for field in ["title", "var", "wait", "uuid", "build"] {
+        assert!(write.contains(field), "write lacks {field}");
+    }
+    for field in ["state", "logs"] {
+        assert!(!write.contains(field), "write has {field}");
+    }
+}
+
+#[test]
+fn schema_types_are_compact() {
+    for tool in [ToolKind::Read, ToolKind::Write] {
+        let schema = schema::input_schema(tool);
+        assert!(schema.get("$schema").is_none());
+        assert_eq!(schema["additionalProperties"], json!(false));
+        for (name, property) in published(tool) {
+            for banned in ["format", "minimum", "default", "title"] {
+                assert!(property.get(banned).is_none(), "{name} has {banned}");
+            }
+            assert!(property["type"].is_string(), "{name}: {property}");
+        }
+    }
+    let write = published(ToolKind::Write);
+    assert_eq!(write["title"], json!({"type": "string"}));
+    assert_eq!(write["uuid"], json!({"type": "string"}));
+    assert_eq!(write["wait"]["type"], "boolean");
+    assert_eq!(write["line"], json!({"type": "integer"}));
+    assert_eq!(write["var"]["type"], "array");
+    assert_eq!(write["var"]["items"], json!({"type": "string"}));
+}
+
+#[test]
+fn a_field_the_tool_does_not_publish_is_still_accepted_and_ignored() {
+    let plain = pr("pr_view");
+    let with_title = Arguments {
+        title: Some("ignored".to_owned()),
+        ..pr("pr_view")
+    };
+    assert_eq!(read(&with_title), read(&plain));
+    let unknown: Result<Arguments, _> =
+        serde_json::from_value(json!({"operation": "pr_view", "nonsense": 1}));
+    assert!(unknown.is_err(), "an unknown field must be rejected");
 }
