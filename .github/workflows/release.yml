@@ -331,4 +331,9 @@ jobs:
           fi
       - name: Publish bitbucket-agent
         working-directory: packages/bitbucket-agent
-        run: npm publish --provenance --access public
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          case "${version}" in
+            *-*) npm publish --provenance --access public --tag next ;;
+            *) npm publish --provenance --access public ;;
+          esac
