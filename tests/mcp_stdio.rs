@@ -343,3 +343,26 @@ fn help_runs_within_a_one_mebibyte_main_stack() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("mcp"));
 }
+
+#[tokio::test]
+async fn tools_list_is_compact_and_points_to_the_skill() {
+    let home = tempfile::tempdir().unwrap();
+    let client = connect(home.path()).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let size = serde_json::to_string(&tools).unwrap().len();
+    assert!(size <= 4000, "tools array is {size} bytes, over 4000");
+    for tool in &tools {
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.chars().count() <= 160,
+            "{}: {description}",
+            tool.name
+        );
+        assert!(
+            description.contains("skill://bitbucket/SKILL.md"),
+            "{}: {description}",
+            tool.name
+        );
+    }
+    client.cancel().await.unwrap();
+}

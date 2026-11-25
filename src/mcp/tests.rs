@@ -1,6 +1,7 @@
 use super::*;
 use crate::cli::{Cli, Commands, pr::PrCommands};
 use clap::Parser;
+use serde_json::json;
 
 fn call(operation: &str) -> Arguments {
     Arguments {
@@ -287,4 +288,234 @@ fn hostile_nul_is_rejected_and_newline_stays_one_argument() {
     };
     let argv = write(&newline).unwrap();
     assert!(argv.contains(&"--body=line1\nline2".to_owned()), "{argv:?}");
+}
+
+fn pipeline_commands(argv: Vec<String>) -> crate::cli::pipeline::PipelineCommands {
+    match parse(argv).command {
+        Commands::Pipeline { command } => command,
+        _ => panic!("not parsed as a pipeline command"),
+    }
+}
+
+#[test]
+fn wait_on_pipeline_trigger_adds_the_switch_and_parses_in_the_cli() {
+    use crate::cli::pipeline::PipelineCommands;
+    let arguments = Arguments {
+        repo: Some("a/b".into()),
+        wait: true,
+        ..call("pipeline_trigger")
+    };
+    let argv = write(&arguments).unwrap();
+    assert!(argv.contains(&"--wait".to_owned()), "{argv:?}");
+    match pipeline_commands(argv) {
+        PipelineCommands::Trigger { wait, .. } => assert!(wait),
+        _ => panic!("not parsed as pipeline trigger"),
+    }
+}
+
+#[test]
+fn wait_on_pipeline_rerun_adds_the_switch_and_parses_in_the_cli() {
+    use crate::cli::pipeline::PipelineCommands;
+    let arguments = Arguments {
+        repo: Some("a/b".into()),
+        build: Some(4),
+        wait: true,
+        ..call("pipeline_rerun")
+    };
+    let argv = write(&arguments).unwrap();
+    assert!(argv.contains(&"--wait".to_owned()), "{argv:?}");
+    match pipeline_commands(argv) {
+        PipelineCommands::Rerun { wait, .. } => assert!(wait),
+        _ => panic!("not parsed as pipeline rerun"),
+    }
+}
+
+#[test]
+fn wait_false_or_absent_adds_nothing_and_is_ignored_by_other_operations() {
+    let trigger = Arguments {
+        repo: Some("a/b".into()),
+        ..call("pipeline_trigger")
+    };
+    assert!(!write(&trigger).unwrap().contains(&"--wait".to_owned()));
+    let rerun = Arguments {
+        repo: Some("a/b".into()),
+        build: Some(4),
+        ..call("pipeline_rerun")
+    };
+    assert!(!write(&rerun).unwrap().contains(&"--wait".to_owned()));
+    let view = Arguments {
+        wait: true,
+        ..pr("pr_view")
+    };
+    assert_eq!(read(&view).unwrap(), read(&pr("pr_view")).unwrap());
+}
+
+fn limited(operation: &str, limit: Option<u32>) -> Arguments {
+    Arguments {
+        limit,
+        ..pr(operation)
+    }
+}
+
+#[test]
+fn long_call_pipeline_wait_is_long_only_when_waiting() {
+    let trigger = |wait| Arguments {
+        wait,
+        ..call("pipeline_trigger")
+    };
+    assert!(is_long_call(ToolKind::Write, &trigger(true)));
+    assert!(!is_long_call(ToolKind::Write, &trigger(false)));
+    let rerun = Arguments {
+        wait: true,
+        ..call("pipeline_rerun")
+    };
+    assert!(is_long_call(ToolKind::Write, &rerun));
+}
+
+#[test]
+fn long_call_pipeline_scans_and_logs_are_long() {
+    assert!(is_long_call(ToolKind::Read, &pr("pr_pipelines")));
+    let view = |logs, full_logs| Arguments {
+        logs,
+        full_logs,
+        ..call("pipeline_view")
+    };
+    assert!(is_long_call(ToolKind::Read, &view(true, false)));
+    assert!(is_long_call(ToolKind::Read, &view(false, true)));
+    assert!(!is_long_call(ToolKind::Read, &view(false, false)));
+}
+
+#[test]
+fn long_call_listing_is_long_only_above_the_default_page() {
+    assert!(!is_long_call(ToolKind::Read, &limited("pr_list", Some(25))));
+    assert!(is_long_call(ToolKind::Read, &limited("pr_list", Some(26))));
+    assert!(!is_long_call(ToolKind::Read, &limited("pr_list", None)));
+    assert!(is_long_call(
+        ToolKind::Read,
+        &limited("repo_list", Some(100))
+    ));
+    for operation in [
+        "pipeline_list",
+        "pr_diffstat",
+        "pr_commits",
+        "pr_activity",
+        "pr_list_comments",
+    ] {
+        assert!(is_long_call(ToolKind::Read, &limited(operation, Some(26))));
+        assert!(!is_long_call(ToolKind::Read, &limited(operation, Some(25))));
+    }
+}
+
+#[test]
+fn long_call_short_operations_are_never_long() {
+    assert!(!is_long_call(
+        ToolKind::Read,
+        &limited("pr_view", Some(500))
+    ));
+    assert!(!is_long_call(
+        ToolKind::Write,
+        &limited("pr_merge", Some(500))
+    ));
+    assert!(!is_long_call(
+        ToolKind::Write,
+        &limited("pipeline_stop", Some(500))
+    ));
+    assert!(!is_long_call(ToolKind::Read, &call("no_such_operation")));
+}
+
+fn published(tool: ToolKind) -> serde_json::Map<String, Value> {
+    let schema = schema::input_schema(tool);
+    match schema.get("properties") {
+        Some(Value::Object(properties)) => properties.clone(),
+        other => panic!("no properties object: {other:?}"),
+    }
+}
+
+fn names(properties: &serde_json::Map<String, Value>) -> std::collections::BTreeSet<String> {
+    properties.keys().cloned().collect()
+}
+
+fn fields_of(operations: &[&str]) -> std::collections::BTreeSet<String> {
+    let mut set: std::collections::BTreeSet<String> = ["operation", "profile", "workspace"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for (name, fields) in OPERATIONS.iter() {
+        if operations.contains(name) {
+            set.extend(fields.iter().filter_map(|f| f.name).map(str::to_owned));
+        }
+    }
+    set
+}
+
+#[test]
+fn schema_each_tool_publishes_exactly_the_fields_of_its_operations() {
+    assert_eq!(
+        names(&published(ToolKind::Read)),
+        fields_of(READ_OPERATIONS)
+    );
+    assert_eq!(
+        names(&published(ToolKind::Write)),
+        fields_of(WRITE_OPERATIONS)
+    );
+}
+
+#[test]
+fn schema_every_operation_has_a_table_entry() {
+    for name in READ_OPERATIONS.iter().chain(WRITE_OPERATIONS) {
+        assert!(OPERATIONS.iter().any(|(op, _)| op == name), "{name}");
+    }
+}
+
+#[test]
+fn schema_fields_are_split_between_the_tools() {
+    let read = names(&published(ToolKind::Read));
+    let write = names(&published(ToolKind::Write));
+    for field in ["state", "logs", "scan_limit", "build"] {
+        assert!(read.contains(field), "read lacks {field}");
+    }
+    for field in ["title", "body", "wait"] {
+        assert!(!read.contains(field), "read has {field}");
+    }
+    for field in ["title", "var", "wait", "uuid", "build"] {
+        assert!(write.contains(field), "write lacks {field}");
+    }
+    for field in ["state", "logs"] {
+        assert!(!write.contains(field), "write has {field}");
+    }
+}
+
+#[test]
+fn schema_types_are_compact() {
+    for tool in [ToolKind::Read, ToolKind::Write] {
+        let schema = schema::input_schema(tool);
+        assert!(schema.get("$schema").is_none());
+        assert_eq!(schema["additionalProperties"], json!(false));
+        for (name, property) in published(tool) {
+            for banned in ["format", "minimum", "default", "title"] {
+                assert!(property.get(banned).is_none(), "{name} has {banned}");
+            }
+            assert!(property["type"].is_string(), "{name}: {property}");
+        }
+    }
+    let write = published(ToolKind::Write);
+    assert_eq!(write["title"], json!({"type": "string"}));
+    assert_eq!(write["uuid"], json!({"type": "string"}));
+    assert_eq!(write["wait"]["type"], "boolean");
+    assert_eq!(write["line"], json!({"type": "integer"}));
+    assert_eq!(write["var"]["type"], "array");
+    assert_eq!(write["var"]["items"], json!({"type": "string"}));
+}
+
+#[test]
+fn a_field_the_tool_does_not_publish_is_still_accepted_and_ignored() {
+    let plain = pr("pr_view");
+    let with_title = Arguments {
+        title: Some("ignored".to_owned()),
+        ..pr("pr_view")
+    };
+    assert_eq!(read(&with_title), read(&plain));
+    let unknown: Result<Arguments, _> =
+        serde_json::from_value(json!({"operation": "pr_view", "nonsense": 1}));
+    assert!(unknown.is_err(), "an unknown field must be rejected");
 }
