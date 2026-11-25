@@ -302,3 +302,38 @@ jobs:
             exit 0
           fi
           cargo publish --token "$CRATES_IO_TOKEN"
+
+  npm-publish:
+    name: Publish to npm
+    needs: create-release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm trusted publishing exchanges this OIDC token for a short-lived publish token; no NPM_TOKEN secret.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          # Trusted publishing needs npm 11.5.1 or later, which Node 24 ships.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Package version matches the tag
+        working-directory: packages/bitbucket-agent
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::packages/bitbucket-agent/package.json version ${version} does not match tag ${TAG}"
+            exit 1
+          fi
+      - name: Publish bitbucket-agent
+        working-directory: packages/bitbucket-agent
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          case "${version}" in
+            *-*) npm publish --provenance --access public --tag next ;;
+            *) npm publish --provenance --access public ;;
+          esac
