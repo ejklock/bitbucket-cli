@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bitbucket_cli::mcp::BitbucketServer;
+use bitbucket_cli::mcp::{BitbucketServer, serve_on};
 use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
@@ -36,7 +36,7 @@ impl Stub {
                 "#!/bin/sh\n\
                  case \"$*\" in *fail*) echo boom >&2; exit 3;; esac\n\
                  case \"$*\" in *--scan-limit=2*) echo $$ > '{pid}'; exec sleep 30;; esac\n\
-                 case \"$*\" in *--scan-limit=1*) sleep 0.3;; esac\n\
+                 case \"$*\" in *--scan-limit=1*) sleep 2;; esac\n\
                  case \"$*\" in *--scan-limit=3*) sleep 0.8;; esac\n\
                  printf 'arg:%s\\n' \"$@\"\n",
                 pid = pidfile.display()
@@ -94,6 +94,7 @@ struct Session {
     inbox: Vec<Value>,
     next_id: u64,
     server: BitbucketServer,
+    serving: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl Session {
@@ -110,13 +111,7 @@ impl Session {
     async fn start(program: &Path, tasks: bool) -> Self {
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
         let server = BitbucketServer::with_heartbeat(program.to_path_buf(), HEARTBEAT);
-        let serving = server.clone();
-        tokio::spawn(async move {
-            use rmcp::ServiceExt;
-            if let Ok(running) = serving.serve(server_io).await {
-                let _ = running.waiting().await;
-            }
-        });
+        let serving = tokio::spawn(serve_on(server.clone(), server_io));
         let (reader, writer) = tokio::io::split(client_io);
         let mut session = Self {
             writer,
@@ -124,6 +119,7 @@ impl Session {
             inbox: Vec::new(),
             next_id: 1,
             server,
+            serving,
         };
         let capabilities = if tasks {
             json!({"extensions": {TASKS_EXTENSION: {}}})
@@ -273,6 +269,24 @@ impl Session {
     fn end(&self) {
         self.server.end_tasks();
     }
+
+    /// Closes the client side of the pipe and returns how the served session ended, without
+    /// ending the tasks by hand.
+    async fn disconnect(self) -> anyhow::Result<()> {
+        let Self {
+            writer,
+            reader,
+            serving,
+            ..
+        } = self;
+        drop(writer);
+        drop(reader);
+        // rmcp drains an in-flight call for up to five seconds before cancelling it.
+        tokio::time::timeout(Duration::from_secs(15), serving)
+            .await
+            .expect("the served session ends after the client disconnects")
+            .expect("the serving task ran")
+    }
 }
 
 fn text_of(result: &Value) -> String {
@@ -304,7 +318,7 @@ async fn task_long_call_answers_at_once_and_completes_with_the_child_stdout() {
     let started = Instant::now();
     let id = session.start_call("bitbucket_read", scan(1), false).await;
     let created = session.answer(id).await;
-    assert!(started.elapsed() < Duration::from_millis(250), "{created}");
+    assert!(started.elapsed() < Duration::from_secs(1), "{created}");
     assert_eq!(created["result"]["resultType"], "task", "{created}");
     assert_eq!(created["result"]["status"], "working", "{created}");
 
@@ -452,6 +466,32 @@ async fn cancel_of_a_synchronous_call_kills_the_child() {
         .await;
     assert_ne!(next["isError"], json!(true), "{next}");
     session.end();
+}
+
+#[tokio::test]
+async fn disconnect_while_a_task_runs_ends_the_session_and_kills_the_child() {
+    let stub = Stub::new();
+    let mut session = Session::declaring(&stub.program).await;
+    session.start_task("bitbucket_read", scan(2), false).await;
+    let pid = stub.pid().await;
+    assert!(alive(pid));
+
+    session.disconnect().await.expect("a clean end");
+
+    assert!(gone_within_five_seconds(pid).await, "child {pid} survived");
+}
+
+#[tokio::test]
+async fn disconnect_while_a_synchronous_call_runs_kills_the_child() {
+    let stub = Stub::new();
+    let mut session = Session::plain(&stub.program).await;
+    session.start_call("bitbucket_read", scan(2), false).await;
+    let pid = stub.pid().await;
+    assert!(alive(pid));
+
+    session.disconnect().await.expect("a clean end");
+
+    assert!(gone_within_five_seconds(pid).await, "child {pid} survived");
 }
 
 #[tokio::test]

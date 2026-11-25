@@ -161,7 +161,7 @@ pub enum ToolKind {
     Write,
 }
 
-/// The CLI's default page size: a listing asking for more than this scans several pages.
+/// The CLI's default page size: a listing asking for more is one larger page, since `limit` is the page length (capped at 100).
 const DEFAULT_PAGE: u32 = 25;
 
 /// Whether a call can run long enough to be worth an MCP task: a pipeline that is waited for,
@@ -854,10 +854,23 @@ fn child_result(output: &std::process::Output) -> CallToolResult {
 pub async fn serve() -> anyhow::Result<()> {
     let program = std::env::current_exe().context("locating the bitbucket executable")?;
     let skills = SkillCatalog::embedded().map_err(anyhow::Error::msg)?;
-    let server = BitbucketServer::with_skills(program, HEARTBEAT, skills);
+    serve_on(
+        BitbucketServer::with_skills(program, HEARTBEAT, skills),
+        stdio(),
+    )
+    .await
+}
+
+/// Serve MCP over `transport` until the peer closes it, then end the tasks so no child
+/// outlives the connection.
+pub async fn serve_on<T, E, A>(server: BitbucketServer, transport: T) -> anyhow::Result<()>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let running = server
         .clone()
-        .serve(stdio())
+        .serve(transport)
         .await
         .context("starting the MCP server")?;
     let served = running.waiting().await.context("serving MCP");
