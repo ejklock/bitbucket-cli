@@ -13,6 +13,7 @@ When the `bitbucket` MCP server is connected, use its tools instead of the shell
 
 - `bitbucket_read`, operations: pr_list, pr_view, pr_diff, pr_diffstat, pr_commits, pr_statuses, pr_activity, pr_list_comments, pr_view_comment, pr_pipelines, pipeline_list, pipeline_view, repo_list, repo_view.
 - `bitbucket_write`, operations: pr_create, pr_edit, pr_comment, pr_approve, pr_unapprove, pr_request_changes, pr_merge, pr_decline, pipeline_trigger, pipeline_stop, pipeline_rerun.
+- `pipeline_trigger` and `pipeline_rerun` take `wait` to block until the pipeline finishes.
 
 ## Otherwise use the CLI
 

@@ -4,25 +4,28 @@
 //! process, runs the command handlers, so their output never reaches the
 //! protocol stream on stdout.
 
+mod calls;
 mod skills;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use anyhow::Context;
+use calls::{ChildRunner, HEARTBEAT, Relay};
 use rmcp::handler::server::common::{schema_for_empty_input, schema_for_input};
 use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ConstString, ContentBlock,
-    CustomRequest, CustomResult, ErrorCode, GetSkillRequestMethod, GetSkillRequestParams,
-    GetSkillResult, Implementation, JsonObject, ListResourcesResult, ListSkillsResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, ResourceContents, ResultType, ServerCapabilities,
-    ServerConfig, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+    ConstString, ContentBlock, CreateTaskResult, CustomRequest, CustomResult, ErrorCode,
+    GetSkillRequestMethod, GetSkillRequestParams, GetSkillResult, GetTaskParams, GetTaskResult,
+    Implementation, JsonObject, ListResourcesResult, ListSkillsResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ResourceContents, ResultType, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
+use rmcp::task_manager::TaskManager;
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, tool_router};
 use serde_json::{Value, json};
@@ -146,6 +149,9 @@ pub struct Arguments {
     /// `KEY=value` secured variables of pipeline_trigger.
     #[serde(default)]
     pub secured_var: Vec<String>,
+    /// Wait for the pipeline to finish, for pipeline_trigger and pipeline_rerun.
+    #[serde(default)]
+    pub wait: bool,
 }
 
 /// Which tool a call arrived on.
@@ -153,6 +159,26 @@ pub struct Arguments {
 pub enum ToolKind {
     Read,
     Write,
+}
+
+/// The CLI's default page size: a listing asking for more than this scans several pages.
+const DEFAULT_PAGE: u32 = 25;
+
+/// Whether a call can run long enough to be worth an MCP task: a pipeline that is waited for,
+/// the pipeline scan of a pull request, pipeline logs, and listings past the default page.
+pub fn is_long_call(tool: ToolKind, arguments: &Arguments) -> bool {
+    let large_page = arguments.limit.is_some_and(|limit| limit > DEFAULT_PAGE);
+    match (tool, arguments.operation.as_str()) {
+        (ToolKind::Write, "pipeline_trigger" | "pipeline_rerun") => arguments.wait,
+        (ToolKind::Read, "pr_pipelines") => true,
+        (ToolKind::Read, "pipeline_view") => arguments.logs || arguments.full_logs,
+        (
+            ToolKind::Read,
+            "pr_list" | "pipeline_list" | "repo_list" | "pr_diffstat" | "pr_commits"
+            | "pr_activity" | "pr_list_comments",
+        ) => large_page,
+        _ => false,
+    }
 }
 
 /// The child's argument vector for a tool call, or the message of the tool
@@ -282,6 +308,9 @@ fn reviewers() -> Field {
 fn destination() -> Field {
     text("destination", |a| &a.destination)
 }
+fn wait() -> Field {
+    switch("wait", |a| a.wait)
+}
 fn close_source_branch() -> Field {
     switch("close_source_branch", |a| a.close_source_branch)
 }
@@ -402,6 +431,7 @@ static OPERATIONS: LazyLock<Vec<(&str, Vec<Field>)>> = LazyLock::new(|| {
                 text("pipeline", |a| &a.pipeline),
                 texts("var", |a| &a.var),
                 texts("secured_var", |a| &a.secured_var),
+                wait(),
             ],
         ),
         (
@@ -413,7 +443,7 @@ static OPERATIONS: LazyLock<Vec<(&str, Vec<Field>)>> = LazyLock::new(|| {
                 text("uuid", |a| &a.uuid),
             ],
         ),
-        ("pipeline_rerun", vec![repo(), build()]),
+        ("pipeline_rerun", vec![repo(), build(), wait()]),
     ]
 });
 
@@ -502,10 +532,11 @@ fn is_repo_slug(repo: &str) -> bool {
     matches!(repo.split('/').collect::<Vec<_>>().as_slice(), [w, r] if segment(w) && segment(r))
 }
 
-/// The server: it runs `program` with the argument vector of each tool call.
+/// The server: it runs the program with the argument vector of each tool call.
 #[derive(Clone)]
 pub struct BitbucketServer {
-    program: Arc<PathBuf>,
+    runner: ChildRunner,
+    tasks: TaskManager,
     router: ToolRouter<Self>,
     skills: Arc<SkillCatalog>,
 }
@@ -513,40 +544,59 @@ pub struct BitbucketServer {
 impl BitbucketServer {
     /// A server whose tool calls run `program`.
     pub fn new(program: PathBuf) -> Self {
-        Self::with_skills(program, SkillCatalog::embedded().unwrap_or_default())
+        Self::with_heartbeat(program, HEARTBEAT)
     }
 
-    fn with_skills(program: PathBuf, skills: SkillCatalog) -> Self {
+    /// A server whose running calls report their progress every `heartbeat`.
+    pub fn with_heartbeat(program: PathBuf, heartbeat: Duration) -> Self {
+        Self::with_skills(
+            program,
+            heartbeat,
+            SkillCatalog::embedded().unwrap_or_default(),
+        )
+    }
+
+    fn with_skills(program: PathBuf, heartbeat: Duration, skills: SkillCatalog) -> Self {
         Self {
-            program: Arc::new(program),
+            runner: ChildRunner::new(program, heartbeat),
+            tasks: TaskManager::new(),
             router: Self::tool_router(),
             skills: Arc::new(skills),
         }
     }
 
+    /// Ends every task in flight; a child still running is killed.
+    pub fn end_tasks(&self) {
+        self.tasks.shutdown();
+    }
+
+    /// Runs one tool call: a task when the call is long and the client declared the tasks
+    /// extension, otherwise in the request itself.
     async fn dispatch(
         &self,
         tool: ToolKind,
         arguments: JsonObject,
-    ) -> Result<CallToolResult, McpError> {
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
         let arguments: Arguments = serde_json::from_value(Value::Object(arguments))
             .map_err(|e| McpError::invalid_params(format!("invalid arguments: {e}"), None))?;
         let argv = match build_argv(tool, &arguments) {
             Ok(argv) => argv,
-            Err(message) => return Ok(tool_error(message)),
+            Err(message) => return Ok(tool_error(message).into()),
         };
-        let output = tokio::process::Command::new(self.program.as_path())
-            .args(&argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
+        let relay = Relay::new(context.peer.clone(), context.meta.get_progress_token());
+        let declared_tasks = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        if declared_tasks && is_long_call(tool, &arguments) {
+            let task = self.runner.run_as_task(&self.tasks, argv, relay);
+            return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+        }
+        let result = self
+            .runner
+            .run_here(&argv, &relay, context.ct.cancelled())
             .await;
-        Ok(match output {
-            Ok(output) => child_result(&output),
-            Err(e) => tool_error(format!("could not run {}: {e}", self.program.display())),
-        })
+        Ok(result.into())
     }
 }
 
@@ -559,8 +609,12 @@ impl BitbucketServer {
         input_schema = input_schema(ToolKind::Read),
         annotations(read_only_hint = true)
     )]
-    async fn bitbucket_read(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
-        self.dispatch(ToolKind::Read, arguments).await
+    async fn bitbucket_read(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.dispatch(ToolKind::Read, arguments, context).await
     }
 
     #[tool(
@@ -570,8 +624,12 @@ impl BitbucketServer {
         input_schema = input_schema(ToolKind::Write),
         annotations(destructive_hint = true, read_only_hint = false)
     )]
-    async fn bitbucket_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
-        self.dispatch(ToolKind::Write, arguments).await
+    async fn bitbucket_write(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.dispatch(ToolKind::Write, arguments, context).await
     }
 }
 
@@ -593,6 +651,7 @@ impl ServerHandler for BitbucketServer {
                 .enable_tools()
                 .enable_resources()
                 .enable_skills()
+                .enable_tasks()
                 .build(),
         )
         .with_server_info(Implementation::from_build_env())
@@ -694,6 +753,24 @@ impl ServerHandler for BitbucketServer {
         Ok(result)
     }
 
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks
+            .get_task(&request.task_id)
+            .map(GetTaskResult::new)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel_task(&request.task_id)
+    }
+
     /// A `skills/get` whose parameters did not parse (no `uri`, or one that is not text)
     /// reaches here instead of `get_skill`: a malformed request, not an unknown method.
     async fn on_custom_request(
@@ -766,11 +843,15 @@ fn child_result(output: &std::process::Output) -> CallToolResult {
 pub async fn serve() -> anyhow::Result<()> {
     let program = std::env::current_exe().context("locating the bitbucket executable")?;
     let skills = SkillCatalog::embedded().map_err(anyhow::Error::msg)?;
-    let running = BitbucketServer::with_skills(program, skills)
+    let server = BitbucketServer::with_skills(program, HEARTBEAT, skills);
+    let running = server
+        .clone()
         .serve(stdio())
         .await
         .context("starting the MCP server")?;
-    running.waiting().await.context("serving MCP")?;
+    let served = running.waiting().await.context("serving MCP");
+    server.end_tasks();
+    served?;
     Ok(())
 }
 

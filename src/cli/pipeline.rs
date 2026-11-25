@@ -114,6 +114,10 @@ pub enum PipelineCommands {
         /// Build number of the pipeline to re-run
         #[arg(short, long)]
         build: u64,
+
+        /// Wait for the new pipeline to complete
+        #[arg(short, long)]
+        wait: bool,
     },
 
     /// View or update the repository pipelines configuration
@@ -685,7 +689,7 @@ impl PipelineCommands {
                 Ok(())
             }
 
-            PipelineCommands::Rerun { repo, build } => {
+            PipelineCommands::Rerun { repo, build, wait } => {
                 let (workspace, repo_slug) = parse_repo(&repo)?;
                 let client = BitbucketClient::from_stored().await?;
 
@@ -720,6 +724,12 @@ impl PipelineCommands {
                     .await?;
 
                 if super::output_json() {
+                    if wait {
+                        let done =
+                            wait_for_pipeline_silently(&client, &workspace, &repo_slug, &new.uuid)
+                                .await?;
+                        return super::print_json(&done);
+                    }
                     return super::print_json(&new);
                 }
 
@@ -730,6 +740,11 @@ impl PipelineCommands {
                     new.build_number,
                     ref_name.cyan()
                 );
+
+                if wait {
+                    println!();
+                    wait_for_pipeline(&client, &workspace, &repo_slug, &new.uuid).await?;
+                }
 
                 Ok(())
             }
