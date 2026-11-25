@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-11-25
+
+### Added
+
+- The release workflow publishes the `bitbucket-agent` npm package on every
+  release tag through npm trusted publishing, with provenance. A prerelease
+  version goes to the `next` dist-tag.
+
 ## [1.4.1] - 2026-11-25
 
 ### Fixed
