@@ -4,16 +4,29 @@
 //! process, runs the command handlers, so their output never reaches the
 //! protocol stream on stdout.
 
+mod skills;
+
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Context;
 use rmcp::handler::server::common::{schema_for_empty_input, schema_for_input};
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject};
+use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
+use rmcp::model::{
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ConstString, ContentBlock,
+    CustomRequest, CustomResult, ErrorCode, GetSkillRequestMethod, GetSkillRequestParams,
+    GetSkillResult, Implementation, JsonObject, ListResourcesResult, ListSkillsResult,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, ResourceContents, ResultType, ServerCapabilities,
+    ServerConfig, Tool,
+};
+use rmcp::service::RequestContext;
 use rmcp::transport::stdio;
-use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_router};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, tool_router};
 use serde_json::{Value, json};
+use skills::SkillCatalog;
 
 /// Operations of the read-only tool, each the `bitbucket` subcommand of the
 /// same name with the first underscore read as a space.
@@ -493,13 +506,21 @@ fn is_repo_slug(repo: &str) -> bool {
 #[derive(Clone)]
 pub struct BitbucketServer {
     program: Arc<PathBuf>,
+    router: ToolRouter<Self>,
+    skills: Arc<SkillCatalog>,
 }
 
 impl BitbucketServer {
     /// A server whose tool calls run `program`.
     pub fn new(program: PathBuf) -> Self {
+        Self::with_skills(program, SkillCatalog::embedded().unwrap_or_default())
+    }
+
+    fn with_skills(program: PathBuf, skills: SkillCatalog) -> Self {
         Self {
             program: Arc::new(program),
+            router: Self::tool_router(),
+            skills: Arc::new(skills),
         }
     }
 
@@ -529,7 +550,7 @@ impl BitbucketServer {
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl BitbucketServer {
     #[tool(
         description = "Read Bitbucket Cloud data (pull requests, pipelines, repositories) as \
@@ -551,6 +572,146 @@ impl BitbucketServer {
     )]
     async fn bitbucket_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         self.dispatch(ToolKind::Write, arguments).await
+    }
+}
+
+/// Sent with the server's capabilities so the model reads the skill before the tools.
+const INSTRUCTIONS: &str = "Read the resource skill://bitbucket/SKILL.md before using the \
+                            bitbucket tools; it says how to use them.";
+
+/// Whether the negotiated revision carries cache hints on list and read answers.
+fn supports_cache_hints(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+impl ServerHandler for BitbucketServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_skills()
+                .build(),
+        )
+        .with_server_info(Implementation::from_build_env())
+        .with_instructions(INSTRUCTIONS)
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Owned(vec![
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
+        ])
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.router
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let hints = supports_cache_hints(&context);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self.router.list_all(),
+            ttl_ms: hints.then_some(0),
+            cache_scope: hints.then_some(CacheScope::Public),
+            ..ListToolsResult::default()
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.router.get(name).cloned()
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let mut result = ListResourcesResult::with_all_items(self.skills.resources());
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let text = self.skills.read(&request.uri).ok_or_else(|| {
+            McpError::invalid_params(format!("no such resource: {}", request.uri), None)
+        })?;
+        let mut result = ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+            uri: request.uri,
+            mime_type: Some("text/markdown".to_owned()),
+            text: text.to_owned(),
+            meta: None,
+        }]);
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result.into())
+    }
+
+    async fn list_skills(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, McpError> {
+        let mut result = ListSkillsResult::with_all_items(self.skills.skills());
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, McpError> {
+        let skill = self.skills.skill(&request.uri).ok_or_else(|| {
+            McpError::invalid_params(format!("no such skill: {}", request.uri), None)
+        })?;
+        let mut result = GetSkillResult::new(skill.clone());
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
+    /// A `skills/get` whose parameters did not parse (no `uri`, or one that is not text)
+    /// reaches here instead of `get_skill`: a malformed request, not an unknown method.
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        if request.method == GetSkillRequestMethod::VALUE {
+            return Err(McpError::invalid_params(
+                "skills/get needs a text `uri`",
+                None,
+            ));
+        }
+        Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            request.method,
+            None,
+        ))
     }
 }
 
@@ -604,7 +765,8 @@ fn child_result(output: &std::process::Output) -> CallToolResult {
 /// this executable for each tool call.
 pub async fn serve() -> anyhow::Result<()> {
     let program = std::env::current_exe().context("locating the bitbucket executable")?;
-    let running = BitbucketServer::new(program)
+    let skills = SkillCatalog::embedded().map_err(anyhow::Error::msg)?;
+    let running = BitbucketServer::with_skills(program, skills)
         .serve(stdio())
         .await
         .context("starting the MCP server")?;

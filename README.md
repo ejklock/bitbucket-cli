@@ -248,6 +248,8 @@ Two tools, each taking an `operation` plus its arguments, and an optional `profi
 
 Write operations act with the permissions of the chosen profile, as the CLI commands do.
 
+The server also serves the bitbucket skill, which says how to use the tools, as the resource `skill://bitbucket/SKILL.md` (and through the MCP skills extension, `skills/list` and `skills/get`). Its instructions tell the model to read it first.
+
 ## ⚙️ Configuration
 
 Configuration is stored in `~/.config/bitbucket-cli/config.toml`:
