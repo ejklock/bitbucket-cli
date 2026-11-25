@@ -138,6 +138,12 @@ pub enum PipelineCommands {
         next_build_number: Option<u64>,
     },
 
+    #[command(flatten)]
+    Nested(NestedPipelineCommands),
+}
+
+#[derive(Subcommand)]
+pub enum NestedPipelineCommands {
     /// Manage repository pipeline variables
     Variable {
         #[command(subcommand)]
@@ -161,6 +167,17 @@ pub enum PipelineCommands {
         #[command(subcommand)]
         command: CacheCommands,
     },
+}
+
+impl NestedPipelineCommands {
+    pub async fn run(self) -> Result<()> {
+        match self {
+            NestedPipelineCommands::Variable { command } => command.run().await,
+            NestedPipelineCommands::WorkspaceVariable { command } => command.run().await,
+            NestedPipelineCommands::Schedule { command } => command.run().await,
+            NestedPipelineCommands::Cache { command } => command.run().await,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -382,11 +399,7 @@ impl PipelineCommands {
                 disable,
                 next_build_number,
             } => config(repo, enable, disable, next_build_number).await,
-
-            PipelineCommands::Variable { command } => command.run().await,
-            PipelineCommands::WorkspaceVariable { command } => command.run().await,
-            PipelineCommands::Schedule { command } => command.run().await,
-            PipelineCommands::Cache { command } => command.run().await,
+            PipelineCommands::Nested(nested) => nested.run().await,
         }
     }
 }
@@ -1896,8 +1909,10 @@ mod tests {
     };
 
     use super::{
-        choose_step, duration_label, enabled_state_message, ensure_braced_uuid, find_variable_uuid,
-        format_bytes, format_duration, is_json_summary, parse_var, pipeline_headline, pipeline_row,
+        CacheCommands, NestedPipelineCommands, PipelineCommands, ScheduleCommands,
+        VariableCommands, WorkspaceVariableCommands, choose_step, duration_label,
+        enabled_state_message, ensure_braced_uuid, find_variable_uuid, format_bytes,
+        format_duration, is_json_summary, parse_var, pipeline_headline, pipeline_row,
         rerun_message, rerun_request, schedule_branch, select_step, step_status_icon,
         take_log_lines, trigger_request, triggered_message, variable_inputs, variable_rows,
     };
@@ -2426,6 +2441,83 @@ mod tests {
         assert_eq!(
             enabled_state_message(None, "w/r"),
             "Pipelines enabled state is unknown for w/r"
+        );
+    }
+
+    fn parse_pipeline(args: &[&str]) -> PipelineCommands {
+        use clap::Parser;
+        let mut argv = vec!["bitbucket", "pipeline"];
+        argv.extend_from_slice(args);
+        match crate::cli::Cli::try_parse_from(argv) {
+            Ok(crate::cli::Cli {
+                command: crate::cli::Commands::Pipeline { command },
+                ..
+            }) => command,
+            Ok(_) => panic!("not a pipeline command"),
+            Err(e) => panic!("rejected by the CLI: {e}"),
+        }
+    }
+
+    #[test]
+    fn nested_subcommands_parse_with_their_flags_through_the_top_level_cli() {
+        assert!(matches!(
+            parse_pipeline(&["variable", "set", "acme/web", "K", "V", "--secured"]),
+            PipelineCommands::Nested(NestedPipelineCommands::Variable {
+                command: VariableCommands::Set { secured: true, .. }
+            })
+        ));
+        assert!(matches!(
+            parse_pipeline(&["workspace-variable", "delete", "K", "acme", "--yes"]),
+            PipelineCommands::Nested(NestedPipelineCommands::WorkspaceVariable {
+                command: WorkspaceVariableCommands::Delete { yes: true, .. }
+            })
+        ));
+        assert!(matches!(
+            parse_pipeline(&[
+                "schedule",
+                "create",
+                "acme/web",
+                "--branch",
+                "main",
+                "--cron",
+                "0 0 12 * * ? *"
+            ]),
+            PipelineCommands::Nested(NestedPipelineCommands::Schedule {
+                command: ScheduleCommands::Create { .. }
+            })
+        ));
+        assert!(matches!(
+            parse_pipeline(&["cache", "delete", "acme/web", "node", "-y"]),
+            PipelineCommands::Nested(NestedPipelineCommands::Cache {
+                command: CacheCommands::Delete { yes: true, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn pipeline_help_lists_all_subcommands_in_declaration_order() {
+        use clap::CommandFactory;
+        let cli = crate::cli::Cli::command();
+        let pipeline = cli.find_subcommand("pipeline").expect("pipeline command");
+        let names: Vec<&str> = pipeline
+            .get_subcommands()
+            .map(|c| c.get_name())
+            .filter(|n| *n != "help")
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "list",
+                "view",
+                "trigger",
+                "stop",
+                "rerun",
+                "config",
+                "variable",
+                "workspace-variable",
+                "schedule",
+                "cache"
+            ]
         );
     }
 }
