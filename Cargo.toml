@@ -17,6 +17,7 @@ exclude = [
     ".github/",
     "*.md",
     "!README.md",
+    "!plugins/bitbucket/skills/bitbucket/SKILL.md",
 ]
 
 [[bin]]

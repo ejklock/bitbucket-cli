@@ -4,16 +4,32 @@
 //! process, runs the command handlers, so their output never reaches the
 //! protocol stream on stdout.
 
+mod calls;
+mod schema;
+mod skills;
+
+use std::borrow::Cow;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use anyhow::Context;
-use rmcp::handler::server::common::{schema_for_empty_input, schema_for_input};
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject};
+use calls::{ChildRunner, HEARTBEAT, Relay};
+use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
+use rmcp::model::{
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+    ConstString, ContentBlock, CreateTaskResult, CustomRequest, CustomResult, ErrorCode,
+    GetSkillRequestMethod, GetSkillRequestParams, GetSkillResult, GetTaskParams, GetTaskResult,
+    Implementation, JsonObject, ListResourcesResult, ListSkillsResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ResourceContents, ResultType, ServerCapabilities, ServerConfig, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::task_manager::TaskManager;
 use rmcp::transport::stdio;
-use rmcp::{ErrorData as McpError, ServiceExt, tool, tool_router};
-use serde_json::{Value, json};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, tool_router};
+use serde_json::Value;
+use skills::SkillCatalog;
 
 /// Operations of the read-only tool, each the `bitbucket` subcommand of the
 /// same name with the first underscore read as a space.
@@ -52,7 +68,7 @@ pub const WRITE_OPERATIONS: &[&str] = &[
 /// The fields of a tool call. One flat object serves every operation of a
 /// tool: Claude drops a tool whose input schema is a top-level `oneOf`.
 /// A field an operation does not take is ignored.
-#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
     /// The command to run.
@@ -133,6 +149,9 @@ pub struct Arguments {
     /// `KEY=value` secured variables of pipeline_trigger.
     #[serde(default)]
     pub secured_var: Vec<String>,
+    /// Wait for the pipeline to finish, for pipeline_trigger and pipeline_rerun.
+    #[serde(default)]
+    pub wait: bool,
 }
 
 /// Which tool a call arrived on.
@@ -140,6 +159,26 @@ pub struct Arguments {
 pub enum ToolKind {
     Read,
     Write,
+}
+
+/// The CLI's default page size: a listing asking for more is one larger page, since `limit` is the page length (capped at 100).
+const DEFAULT_PAGE: u32 = 25;
+
+/// Whether a call can run long enough to be worth an MCP task: a pipeline that is waited for,
+/// the pipeline scan of a pull request, pipeline logs, and listings past the default page.
+pub fn is_long_call(tool: ToolKind, arguments: &Arguments) -> bool {
+    let large_page = arguments.limit.is_some_and(|limit| limit > DEFAULT_PAGE);
+    match (tool, arguments.operation.as_str()) {
+        (ToolKind::Write, "pipeline_trigger" | "pipeline_rerun") => arguments.wait,
+        (ToolKind::Read, "pr_pipelines") => true,
+        (ToolKind::Read, "pipeline_view") => arguments.logs || arguments.full_logs,
+        (
+            ToolKind::Read,
+            "pr_list" | "pipeline_list" | "repo_list" | "pr_diffstat" | "pr_commits"
+            | "pr_activity" | "pr_list_comments",
+        ) => large_page,
+        _ => false,
+    }
 }
 
 /// The child's argument vector for a tool call, or the message of the tool
@@ -175,18 +214,46 @@ pub fn build_argv(tool: ToolKind, arguments: &Arguments) -> Result<Vec<String>, 
     Ok(call.argv)
 }
 
+/// The kind of value a field carries, which fixes its published JSON type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Number,
+    Switch,
+    Texts,
+}
+
 /// One argument an operation takes: appends itself to the call's argument
-/// vector, or rejects the call.
-type Field = Box<dyn Fn(&mut Call) -> Step + Send + Sync>;
+/// vector, or rejects the call. `name` is the published field it reads, absent
+/// for a check that reads none.
+struct Field {
+    name: Option<&'static str>,
+    kind: Kind,
+    apply: Box<dyn Fn(&mut Call) -> Step + Send + Sync>,
+}
+
+impl Field {
+    fn new(
+        name: &'static str,
+        kind: Kind,
+        apply: impl Fn(&mut Call) -> Step + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: Some(name),
+            kind,
+            apply: Box::new(apply),
+        }
+    }
+}
 
 /// The `repo` positional.
 fn repo() -> Field {
-    Box::new(|call| call.repo())
+    Field::new("repo", Kind::Text, |call| call.repo())
 }
 
 /// A required numeric positional.
 fn positional(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Number, move |call| {
         call.argv
             .push(required(name, get(call.arguments))?.to_string());
         Ok(())
@@ -195,22 +262,28 @@ fn positional(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
 
 /// An optional `--flag=value`.
 fn text(name: &'static str, get: fn(&Arguments) -> &Option<String>) -> Field {
-    Box::new(move |call| call.text(name, get(call.arguments)))
+    Field::new(name, Kind::Text, move |call| {
+        call.text(name, get(call.arguments))
+    })
 }
 
 /// A required `--flag=value`.
 fn required_text(name: &'static str, get: fn(&Arguments) -> &Option<String>) -> Field {
-    Box::new(move |call| call.required_text(name, get(call.arguments)))
+    Field::new(name, Kind::Text, move |call| {
+        call.required_text(name, get(call.arguments))
+    })
 }
 
 /// A repeated `--flag=value`.
 fn texts(name: &'static str, get: fn(&Arguments) -> &[String]) -> Field {
-    Box::new(move |call| call.texts(name, get(call.arguments)))
+    Field::new(name, Kind::Texts, move |call| {
+        call.texts(name, get(call.arguments))
+    })
 }
 
 /// An optional numeric `--flag=value`.
 fn number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Number, move |call| {
         call.number(name, get(call.arguments));
         Ok(())
     })
@@ -218,7 +291,7 @@ fn number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
 
 /// A required numeric `--flag=value`.
 fn required_number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Number, move |call| {
         call.number(name, Some(required(name, get(call.arguments))?));
         Ok(())
     })
@@ -226,7 +299,7 @@ fn required_number(name: &'static str, get: fn(&Arguments) -> Option<u64>) -> Fi
 
 /// A `--flag` present only when on.
 fn switch(name: &'static str, get: fn(&Arguments) -> bool) -> Field {
-    Box::new(move |call| {
+    Field::new(name, Kind::Switch, move |call| {
         call.switch(name, get(call.arguments));
         Ok(())
     })
@@ -234,12 +307,16 @@ fn switch(name: &'static str, get: fn(&Arguments) -> bool) -> Field {
 
 /// Rejects a call with neither `build` nor `uuid`.
 fn build_or_uuid() -> Field {
-    Box::new(|call| {
-        if call.arguments.build.is_none() && call.arguments.uuid.is_none() {
-            return Err("`build` or `uuid` is required".to_owned());
-        }
-        Ok(())
-    })
+    Field {
+        name: None,
+        kind: Kind::Text,
+        apply: Box::new(|call| {
+            if call.arguments.build.is_none() && call.arguments.uuid.is_none() {
+                return Err("`build` or `uuid` is required".to_owned());
+            }
+            Ok(())
+        }),
+    }
 }
 
 fn id() -> Field {
@@ -268,6 +345,9 @@ fn reviewers() -> Field {
 }
 fn destination() -> Field {
     text("destination", |a| &a.destination)
+}
+fn wait() -> Field {
+    switch("wait", |a| a.wait)
 }
 fn close_source_branch() -> Field {
     switch("close_source_branch", |a| a.close_source_branch)
@@ -389,6 +469,7 @@ static OPERATIONS: LazyLock<Vec<(&str, Vec<Field>)>> = LazyLock::new(|| {
                 text("pipeline", |a| &a.pipeline),
                 texts("var", |a| &a.var),
                 texts("secured_var", |a| &a.secured_var),
+                wait(),
             ],
         ),
         (
@@ -400,7 +481,7 @@ static OPERATIONS: LazyLock<Vec<(&str, Vec<Field>)>> = LazyLock::new(|| {
                 text("uuid", |a| &a.uuid),
             ],
         ),
-        ("pipeline_rerun", vec![repo(), build()]),
+        ("pipeline_rerun", vec![repo(), build(), wait()]),
     ]
 });
 
@@ -417,7 +498,7 @@ impl Call<'_> {
         let Some((_, fields)) = OPERATIONS.iter().find(|(name, _)| *name == operation) else {
             return Err(format!("unsupported `operation` {operation:?}"));
         };
-        fields.iter().try_for_each(|field| field(self))
+        fields.iter().try_for_each(|field| (field.apply)(self))
     }
 
     /// The `repo` positional, `workspace/repo-slug`.
@@ -489,92 +570,260 @@ fn is_repo_slug(repo: &str) -> bool {
     matches!(repo.split('/').collect::<Vec<_>>().as_slice(), [w, r] if segment(w) && segment(r))
 }
 
-/// The server: it runs `program` with the argument vector of each tool call.
+/// The server: it runs the program with the argument vector of each tool call.
 #[derive(Clone)]
 pub struct BitbucketServer {
-    program: Arc<PathBuf>,
+    runner: ChildRunner,
+    tasks: TaskManager,
+    router: ToolRouter<Self>,
+    skills: Arc<SkillCatalog>,
 }
 
 impl BitbucketServer {
     /// A server whose tool calls run `program`.
     pub fn new(program: PathBuf) -> Self {
+        Self::with_heartbeat(program, HEARTBEAT)
+    }
+
+    /// A server whose running calls report their progress every `heartbeat`.
+    pub fn with_heartbeat(program: PathBuf, heartbeat: Duration) -> Self {
+        Self::with_skills(
+            program,
+            heartbeat,
+            SkillCatalog::embedded().unwrap_or_default(),
+        )
+    }
+
+    fn with_skills(program: PathBuf, heartbeat: Duration, skills: SkillCatalog) -> Self {
         Self {
-            program: Arc::new(program),
+            runner: ChildRunner::new(program, heartbeat),
+            tasks: TaskManager::new(),
+            router: Self::tool_router(),
+            skills: Arc::new(skills),
         }
     }
 
+    /// Ends every task in flight; a child still running is killed.
+    pub fn end_tasks(&self) {
+        self.tasks.shutdown();
+    }
+
+    /// Runs one tool call: a task when the call is long and the client declared the tasks
+    /// extension, otherwise in the request itself.
     async fn dispatch(
         &self,
         tool: ToolKind,
         arguments: JsonObject,
-    ) -> Result<CallToolResult, McpError> {
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
         let arguments: Arguments = serde_json::from_value(Value::Object(arguments))
             .map_err(|e| McpError::invalid_params(format!("invalid arguments: {e}"), None))?;
         let argv = match build_argv(tool, &arguments) {
             Ok(argv) => argv,
-            Err(message) => return Ok(tool_error(message)),
+            Err(message) => return Ok(tool_error(message).into()),
         };
-        let output = tokio::process::Command::new(self.program.as_path())
-            .args(&argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
+        let relay = Relay::new(context.peer.clone(), context.meta.get_progress_token());
+        let declared_tasks = context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+        if declared_tasks && is_long_call(tool, &arguments) {
+            let task = self.runner.run_as_task(&self.tasks, argv, relay);
+            return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+        }
+        let result = self
+            .runner
+            .run_here(&argv, &relay, context.ct.cancelled())
             .await;
-        Ok(match output {
-            Ok(output) => child_result(&output),
-            Err(e) => tool_error(format!("could not run {}: {e}", self.program.display())),
-        })
+        Ok(result.into())
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl BitbucketServer {
     #[tool(
-        description = "Read Bitbucket Cloud data (pull requests, pipelines, repositories) as \
-                       the `bitbucket --output json` commands print it. Select the command \
-                       with `operation`.",
-        input_schema = input_schema(ToolKind::Read),
+        description = "Read Bitbucket Cloud data. Arguments per operation: skill://bitbucket/SKILL.md.",
+        input_schema = schema::input_schema(ToolKind::Read),
         annotations(read_only_hint = true)
     )]
-    async fn bitbucket_read(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
-        self.dispatch(ToolKind::Read, arguments).await
+    async fn bitbucket_read(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.dispatch(ToolKind::Read, arguments, context).await
     }
 
     #[tool(
-        description = "Change Bitbucket Cloud data (create, edit, comment on, approve, merge or \
-                       decline a pull request; trigger, stop or rerun a pipeline). Select the \
-                       command with `operation`.",
-        input_schema = input_schema(ToolKind::Write),
+        description = "Change Bitbucket Cloud data. Arguments per operation: skill://bitbucket/SKILL.md.",
+        input_schema = schema::input_schema(ToolKind::Write),
         annotations(destructive_hint = true, read_only_hint = false)
     )]
-    async fn bitbucket_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
-        self.dispatch(ToolKind::Write, arguments).await
+    async fn bitbucket_write(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.dispatch(ToolKind::Write, arguments, context).await
     }
 }
 
-/// The published input schema of a tool: the derived flat object with
-/// `operation` narrowed to the operations of that tool.
-fn input_schema(tool: ToolKind) -> Arc<JsonObject> {
-    let operations = match tool {
-        ToolKind::Read => READ_OPERATIONS,
-        ToolKind::Write => WRITE_OPERATIONS,
-    };
-    let mut schema = schema_for_input::<Arguments>().unwrap_or_else(|_| schema_for_empty_input());
-    let flat = Arc::make_mut(&mut schema);
-    if let Some(Value::Object(properties)) = flat.get_mut("properties") {
-        properties.insert(
-            "operation".to_owned(),
-            json!({
-                "type": "string",
-                "enum": operations,
-                "description": "The command to run."
-            }),
-        );
+/// Sent with the server's capabilities so the model reads the skill before the tools.
+const INSTRUCTIONS: &str = "Read the resource skill://bitbucket/SKILL.md before using the \
+                            bitbucket tools; it says how to use them.";
+
+/// Whether the negotiated revision carries cache hints on list and read answers.
+fn supports_cache_hints(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+impl ServerHandler for BitbucketServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_skills()
+                .enable_tasks()
+                .build(),
+        )
+        .with_server_info(Implementation::from_build_env())
+        .with_instructions(INSTRUCTIONS)
     }
-    flat.insert("required".to_owned(), json!(["operation"]));
-    schema
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Owned(vec![
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
+        ])
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.router
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let hints = supports_cache_hints(&context);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self.router.list_all(),
+            ttl_ms: hints.then_some(0),
+            cache_scope: hints.then_some(CacheScope::Public),
+            ..ListToolsResult::default()
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.router.get(name).cloned()
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let mut result = ListResourcesResult::with_all_items(self.skills.resources());
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let text = self.skills.read(&request.uri).ok_or_else(|| {
+            McpError::invalid_params(format!("no such resource: {}", request.uri), None)
+        })?;
+        let mut result = ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+            uri: request.uri,
+            mime_type: Some("text/markdown".to_owned()),
+            text: text.to_owned(),
+            meta: None,
+        }]);
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result.into())
+    }
+
+    async fn list_skills(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, McpError> {
+        let mut result = ListSkillsResult::with_all_items(self.skills.skills());
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, McpError> {
+        let skill = self.skills.skill(&request.uri).ok_or_else(|| {
+            McpError::invalid_params(format!("no such skill: {}", request.uri), None)
+        })?;
+        let mut result = GetSkillResult::new(skill.clone());
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks
+            .get_task(&request.task_id)
+            .map(GetTaskResult::new)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel_task(&request.task_id)
+    }
+
+    /// A `skills/get` whose parameters did not parse (no `uri`, or one that is not text)
+    /// reaches here instead of `get_skill`: a malformed request, not an unknown method.
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        if request.method == GetSkillRequestMethod::VALUE {
+            return Err(McpError::invalid_params(
+                "skills/get needs a text `uri`",
+                None,
+            ));
+        }
+        Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            request.method,
+            None,
+        ))
+    }
 }
 
 /// A failed call: the message becomes an `isError` result.
@@ -604,11 +853,29 @@ fn child_result(output: &std::process::Output) -> CallToolResult {
 /// this executable for each tool call.
 pub async fn serve() -> anyhow::Result<()> {
     let program = std::env::current_exe().context("locating the bitbucket executable")?;
-    let running = BitbucketServer::new(program)
-        .serve(stdio())
+    let skills = SkillCatalog::embedded().map_err(anyhow::Error::msg)?;
+    serve_on(
+        BitbucketServer::with_skills(program, HEARTBEAT, skills),
+        stdio(),
+    )
+    .await
+}
+
+/// Serve MCP over `transport` until the peer closes it, then end the tasks so no child
+/// outlives the connection.
+pub async fn serve_on<T, E, A>(server: BitbucketServer, transport: T) -> anyhow::Result<()>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let running = server
+        .clone()
+        .serve(transport)
         .await
         .context("starting the MCP server")?;
-    running.waiting().await.context("serving MCP")?;
+    let served = running.waiting().await.context("serving MCP");
+    server.end_tasks();
+    served?;
     Ok(())
 }
 

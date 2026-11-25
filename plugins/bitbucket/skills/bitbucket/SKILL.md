@@ -13,6 +13,24 @@ When the `bitbucket` MCP server is connected, use its tools instead of the shell
 
 - `bitbucket_read`, operations: pr_list, pr_view, pr_diff, pr_diffstat, pr_commits, pr_statuses, pr_activity, pr_list_comments, pr_view_comment, pr_pipelines, pipeline_list, pipeline_view, repo_list, repo_view.
 - `bitbucket_write`, operations: pr_create, pr_edit, pr_comment, pr_approve, pr_unapprove, pr_request_changes, pr_merge, pr_decline, pipeline_trigger, pipeline_stop, pipeline_rerun.
+- `pipeline_trigger` and `pipeline_rerun` take `wait` to block until the pipeline finishes.
+- Arguments per operation (`*` required; `repo` is `workspace/repo-slug`; `limit` is results per page, max 100):
+  - `pr_list`: repo*, state (list: open, merged, declined, superseded), query, sort, page, limit
+  - `pr_view`, `pr_diff`, `pr_statuses`, `pr_approve`, `pr_unapprove`, `pr_request_changes`, `pr_decline`: repo*, id*
+  - `pr_diffstat`, `pr_commits`, `pr_activity`, `pr_list_comments`: repo*, id*, limit
+  - `pr_view_comment`: repo*, id*, comment_id*
+  - `pr_pipelines`: repo*, id*, scan_limit
+  - `pipeline_list`: repo*, limit, status, target_branch, sort, page
+  - `pipeline_view`: repo*, build*, logs, full_logs, step
+  - `repo_list`: limit, role, query, sort, page (`workspace` selects the workspace)
+  - `repo_view`: repo*
+  - `pr_create`: repo*, title*, source*, destination, body, reviewers (comma-separated), close_source_branch
+  - `pr_edit`: repo*, id*, title, body, reviewers, destination
+  - `pr_comment`: repo*, id*, body*, path, line (needs path), parent (reply to a comment id)
+  - `pr_merge`: repo*, id*, strategy (merge-commit, squash or fast-forward), message, close_source_branch
+  - `pipeline_trigger`: repo*, branch, commit, pipeline, var and secured_var (lists of KEY=VALUE), wait
+  - `pipeline_stop`: repo*, build or uuid
+  - `pipeline_rerun`: repo*, build*, wait
 
 ## Otherwise use the CLI
 
