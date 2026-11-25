@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-25
+
+### Added
+
+- `bitbucket mcp` serves the bitbucket skill as the resource
+  `skill://bitbucket/SKILL.md` over the MCP skills extension, and its server
+  instructions point at it.
+- `bitbucket mcp` runs long tool calls as MCP tasks for clients that declare
+  the tasks extension: a pipeline trigger or rerun that waits, PR pipelines,
+  pipeline logs and listings above 25 items. A progress heartbeat runs every
+  5 s; cancelling the task or closing the client stops the call.
+- `bitbucket pipeline rerun --wait` (`-w`) waits for the rerun pipeline like
+  `pipeline trigger --wait`.
+
+### Changed
+
+- `bitbucket mcp` publishes compact per-tool schemas: `tools/list` drops from
+  about 9 KB to 2.5 KB. The per-operation arguments now live in the skill.
+
 ## [1.3.3] - 2026-11-23
 
 ### Fixed
