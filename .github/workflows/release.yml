@@ -45,7 +45,9 @@ jobs:
             asset_name: bitbucket-linux-arm64
           # One macOS job builds both darwin targets and merges them with lipo.
           # The universal binary is published under both darwin asset names.
-          - os: macos-15
+          # Intel image: the arm64 macOS pool left release jobs unassigned for
+          # want of capacity, and an x64 host cross-compiles both targets.
+          - os: macos-15-intel
             target: universal-apple-darwin
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             artifact_name: bitbucket
