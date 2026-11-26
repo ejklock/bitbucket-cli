@@ -1,6 +1,6 @@
 [package]
 name = "bitbucket-cli"
-version = "1.4.2"
+version = "1.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Command-line interface, TUI and MCP server for Bitbucket Cloud: repositories, pull requests, issues and pipelines, with multi-account profiles"
@@ -84,6 +84,7 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false }
 tempfile = "3"
+wiremock = "0.6"
 rmcp = { version = "3.9.0", features = ["client", "transport-child-process"] }
 
 [lib]

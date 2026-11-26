@@ -15,11 +15,17 @@ pub(crate) const USER_AGENT: &str = concat!("bitbucket-cli/", env!("CARGO_PKG_VE
 pub struct BitbucketClient {
     client: Client,
     credential: Credential,
+    base_url: String,
 }
 
 impl BitbucketClient {
     /// Create a new authenticated client
     pub fn new(credential: Credential) -> Result<Self> {
+        Self::with_base_url(credential, API_BASE_URL)
+    }
+
+    /// Create a client that talks to `base_url` instead of the Bitbucket API.
+    pub(crate) fn with_base_url(credential: Credential, base_url: &str) -> Result<Self> {
         let client = Client::builder()
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
@@ -27,7 +33,11 @@ impl BitbucketClient {
             .build()
             .context("Failed to create HTTP client")?;
 
-        Ok(Self { client, credential })
+        Ok(Self {
+            client,
+            credential,
+            base_url: base_url.to_string(),
+        })
     }
 
     /// Create a client from stored credentials, automatically refreshing if needed
@@ -72,7 +82,7 @@ impl BitbucketClient {
 
     /// Build a URL for an API endpoint
     pub fn url(&self, path: &str) -> String {
-        format!("{}{}", API_BASE_URL, path)
+        format!("{}{}", self.base_url, path)
     }
 
     /// Make a GET request

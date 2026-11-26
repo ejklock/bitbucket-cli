@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::{ColoredString, Colorize};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::time::Duration;
 use tabled::{Table, Tabled};
 
 use super::{confirm_or_abort, parse_repo, resolve_workspace};
@@ -60,6 +61,10 @@ pub enum PipelineCommands {
         /// Print complete step logs instead of the first 50 lines (implies --logs)
         #[arg(long)]
         full_logs: bool,
+
+        /// Wait for the pipeline to settle before showing it
+        #[arg(short, long)]
+        wait: bool,
     },
 
     /// Trigger a new pipeline
@@ -381,7 +386,8 @@ impl PipelineCommands {
                 logs,
                 step,
                 full_logs,
-            } => view(repo, build, logs, step, full_logs).await,
+                wait,
+            } => view(repo, build, logs, step, full_logs, wait).await,
             PipelineCommands::Trigger {
                 repo,
                 branch,
@@ -476,22 +482,66 @@ fn pipeline_row(pipeline: &Pipeline) -> PipelineRow {
     }
 }
 
+/// Fetch the pipeline with build number `build`; with `wait`, keep polling
+/// every `poll_interval` until it settles, under a stderr spinner when
+/// `show_spinner` is set.
+async fn fetch_pipeline_for_view(
+    client: &BitbucketClient,
+    workspace: &str,
+    repo_slug: &str,
+    build: u64,
+    wait: bool,
+    show_spinner: bool,
+    poll_interval: Duration,
+) -> Result<Pipeline> {
+    let pipeline = client
+        .get_pipeline_by_build_number(workspace, repo_slug, build)
+        .await?;
+
+    if !wait || is_settled(&pipeline.state.name) {
+        return Ok(pipeline);
+    }
+
+    let spinner = show_spinner.then(|| {
+        let pb = ProgressBar::new_spinner();
+        pb.set_message("Waiting for pipeline to complete...");
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb
+    });
+    let settled =
+        wait_for_pipeline_silently(client, workspace, repo_slug, &pipeline.uuid, poll_interval)
+            .await;
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+    settled
+}
+
 async fn view(
     repo: String,
     build: u64,
     logs: bool,
     step: Option<String>,
     full_logs: bool,
+    wait: bool,
 ) -> Result<()> {
     let (workspace, repo_slug) = parse_repo(&repo)?;
     let client = BitbucketClient::from_stored().await?;
     let show_logs = logs || full_logs;
+    let json = super::output_json();
 
-    let pipeline = client
-        .get_pipeline_by_build_number(&workspace, &repo_slug, build)
-        .await?;
+    let pipeline = fetch_pipeline_for_view(
+        &client,
+        &workspace,
+        &repo_slug,
+        build,
+        wait,
+        !is_json_summary(json, show_logs),
+        POLL_INTERVAL,
+    )
+    .await?;
 
-    if is_json_summary(super::output_json(), show_logs) {
+    if is_json_summary(json, show_logs) {
         return view_json(&client, &workspace, &repo_slug, &pipeline, step.as_deref()).await;
     }
 
@@ -819,8 +869,14 @@ async fn report_triggered(
 ) -> Result<()> {
     if super::output_json() {
         if wait {
-            let done =
-                wait_for_pipeline_silently(client, workspace, repo_slug, &triggered.uuid).await?;
+            let done = wait_for_pipeline_silently(
+                client,
+                workspace,
+                repo_slug,
+                &triggered.uuid,
+                POLL_INTERVAL,
+            )
+            .await?;
             return super::print_json(&done);
         }
         return super::print_json(triggered);
@@ -830,7 +886,7 @@ async fn report_triggered(
 
     if wait {
         println!();
-        wait_for_pipeline(client, workspace, repo_slug, &triggered.uuid).await?;
+        wait_for_pipeline(client, workspace, repo_slug, &triggered.uuid, POLL_INTERVAL).await?;
     }
 
     Ok(())
@@ -1497,32 +1553,87 @@ impl CacheCommands {
     }
 }
 
-/// Poll a pipeline every 5 seconds until it reaches a terminal state (same
-/// states as [`wait_for_pipeline`]) without any terminal output, and return
-/// the final pipeline for JSON rendering.
+/// How often the waiting commands re-check a pipeline.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A pipeline that will not progress on its own: completed, halted, or paused
+/// (a paused pipeline needs a manual resume in the Bitbucket UI).
+fn is_settled(state: &PipelineStateName) -> bool {
+    matches!(
+        state,
+        PipelineStateName::Completed | PipelineStateName::Halted | PipelineStateName::Paused
+    )
+}
+
+/// Poll a pipeline every `poll_interval` until it reaches a terminal state
+/// (same states as [`wait_for_pipeline`]) without any terminal output, and
+/// return the final pipeline for JSON rendering.
 async fn wait_for_pipeline_silently(
     client: &BitbucketClient,
     workspace: &str,
     repo_slug: &str,
     pipeline_uuid: &str,
+    poll_interval: Duration,
 ) -> Result<Pipeline> {
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(poll_interval).await;
 
         let current = client
             .get_pipeline(workspace, repo_slug, pipeline_uuid)
             .await?;
 
-        match current.state.name {
-            PipelineStateName::Completed
-            | PipelineStateName::Halted
-            | PipelineStateName::Paused => return Ok(current),
-            _ => {}
+        if is_settled(&current.state.name) {
+            return Ok(current);
         }
     }
 }
 
-/// Poll a pipeline every 5 seconds until it reaches a state where waiting is
+/// Print the one-line outcome of a settled pipeline.
+fn print_settled_message(current: &Pipeline) {
+    match current.state.name {
+        PipelineStateName::Completed => {
+            if let Some(result) = &current.state.result {
+                match result.name {
+                    PipelineResultName::Successful => {
+                        println!(
+                            "{} Pipeline #{} completed successfully!",
+                            "✓".green(),
+                            current.build_number
+                        );
+                    }
+                    PipelineResultName::Failed => {
+                        println!("{} Pipeline #{} failed", "✗".red(), current.build_number);
+                    }
+                    _ => {
+                        println!(
+                            "Pipeline #{} completed with status: {:?}",
+                            current.build_number, result.name
+                        );
+                    }
+                }
+            }
+        }
+        PipelineStateName::Halted => {
+            println!(
+                "{} Pipeline #{} was halted",
+                "⚠".yellow(),
+                current.build_number
+            );
+        }
+        PipelineStateName::Pending | PipelineStateName::InProgress => {
+            unreachable!("is_settled returned true only for completed, halted and paused")
+        }
+        PipelineStateName::Paused => {
+            println!(
+                "{} Pipeline #{} is PAUSED and requires manual resume",
+                "⚠".yellow(),
+                current.build_number
+            );
+        }
+    }
+}
+
+/// Poll a pipeline every `poll_interval` until it reaches a state where waiting is
 /// pointless: completed, halted, or paused (paused pipelines never progress
 /// without a manual resume in the Bitbucket UI, so treat them as terminal).
 async fn wait_for_pipeline(
@@ -1530,66 +1641,27 @@ async fn wait_for_pipeline(
     workspace: &str,
     repo_slug: &str,
     pipeline_uuid: &str,
+    poll_interval: Duration,
 ) -> Result<()> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(ProgressStyle::default_spinner().template("{spinner:.blue} {msg}")?);
     pb.set_message("Waiting for pipeline to complete...");
 
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(poll_interval).await;
 
         let current = client
             .get_pipeline(workspace, repo_slug, pipeline_uuid)
             .await?;
 
-        match current.state.name {
-            PipelineStateName::Completed => {
-                pb.finish_and_clear();
-
-                if let Some(result) = &current.state.result {
-                    match result.name {
-                        PipelineResultName::Successful => {
-                            println!(
-                                "{} Pipeline #{} completed successfully!",
-                                "✓".green(),
-                                current.build_number
-                            );
-                        }
-                        PipelineResultName::Failed => {
-                            println!("{} Pipeline #{} failed", "✗".red(), current.build_number);
-                        }
-                        _ => {
-                            println!(
-                                "Pipeline #{} completed with status: {:?}",
-                                current.build_number, result.name
-                            );
-                        }
-                    }
-                }
-                break;
-            }
-            PipelineStateName::Halted => {
-                pb.finish_and_clear();
-                println!(
-                    "{} Pipeline #{} was halted",
-                    "⚠".yellow(),
-                    current.build_number
-                );
-                break;
-            }
-            PipelineStateName::Paused => {
-                pb.finish_and_clear();
-                println!(
-                    "{} Pipeline #{} is PAUSED and requires manual resume",
-                    "⚠".yellow(),
-                    current.build_number
-                );
-                break;
-            }
-            _ => {
-                pb.tick();
-            }
+        if !is_settled(&current.state.name) {
+            pb.tick();
+            continue;
         }
+
+        pb.finish_and_clear();
+        print_settled_message(&current);
+        break;
     }
 
     Ok(())
@@ -1912,10 +1984,21 @@ mod tests {
         CacheCommands, NestedPipelineCommands, PipelineCommands, ScheduleCommands,
         VariableCommands, WorkspaceVariableCommands, choose_step, duration_label,
         enabled_state_message, ensure_braced_uuid, find_variable_uuid, format_bytes,
-        format_duration, is_json_summary, parse_var, pipeline_headline, pipeline_row,
+        format_duration, is_json_summary, is_settled, parse_var, pipeline_headline, pipeline_row,
         rerun_message, rerun_request, schedule_branch, select_step, step_status_icon,
         take_log_lines, trigger_request, triggered_message, variable_inputs, variable_rows,
     };
+
+    #[test]
+    fn settled_states_are_completed_halted_and_paused() {
+        use crate::models::PipelineStateName::*;
+        for state in [Completed, Halted, Paused] {
+            assert!(is_settled(&state), "{state:?}");
+        }
+        for state in [Pending, InProgress] {
+            assert!(!is_settled(&state), "{state:?}");
+        }
+    }
 
     fn log_with_lines(n: usize) -> String {
         (0..n).map(|i| format!("line {}\n", i)).collect()
@@ -2519,5 +2602,140 @@ mod tests {
                 "cache"
             ]
         );
+    }
+
+    mod view_wait {
+        use std::time::Duration;
+
+        use serde_json::{Value, json};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::api::BitbucketClient;
+        use crate::auth::Credential;
+        use crate::models::PipelineStateName;
+
+        use super::super::fetch_pipeline_for_view;
+
+        const LIST_PATH: &str = "/repositories/ws/repo/pipelines";
+        const POLL_PATH: &str = "/repositories/ws/repo/pipelines/p-1";
+        const INTERVAL: Duration = Duration::from_millis(5);
+
+        fn pipeline_json(state: &str) -> Value {
+            json!({
+                "uuid": "p-1",
+                "build_number": 7,
+                "target": {"type": "pipeline_ref_target"},
+                "state": {"name": state, "type": "pipeline_state"},
+                "created_on": "2024-03-05T10:30:00Z",
+            })
+        }
+
+        async fn server_listing(state: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(LIST_PATH))
+                .and(query_param("page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "values": [pipeline_json(state)],
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        async fn expect_polls(server: &MockServer, polls: u64) {
+            Mock::given(method("GET"))
+                .and(path(POLL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pipeline_json("COMPLETED")))
+                .expect(polls)
+                .mount(server)
+                .await;
+        }
+
+        fn client_for(server: &MockServer) -> BitbucketClient {
+            let credential = Credential::ApiKey {
+                username: "user".to_string(),
+                api_key: "key".to_string(),
+            };
+            BitbucketClient::with_base_url(credential, &server.uri()).unwrap()
+        }
+
+        async fn fetch(server: &MockServer, wait: bool) -> anyhow::Result<crate::models::Pipeline> {
+            let client = client_for(server);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_pipeline_for_view(&client, "ws", "repo", 7, wait, false, INTERVAL),
+            )
+            .await
+            .expect("fetching the pipeline did not finish within 5 seconds")
+        }
+
+        #[tokio::test]
+        async fn settled_pipeline_is_returned_without_polling() {
+            for (state, expected) in [
+                ("COMPLETED", PipelineStateName::Completed),
+                ("PAUSED", PipelineStateName::Paused),
+                ("HALTED", PipelineStateName::Halted),
+            ] {
+                let server = server_listing(state).await;
+                expect_polls(&server, 0).await;
+
+                let pipeline = fetch(&server, true).await.unwrap();
+
+                assert_eq!(pipeline.state.name, expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn running_pipeline_without_wait_is_returned_without_polling() {
+            let server = server_listing("IN_PROGRESS").await;
+            expect_polls(&server, 0).await;
+
+            let pipeline = fetch(&server, false).await.unwrap();
+
+            assert_eq!(pipeline.state.name, PipelineStateName::InProgress);
+        }
+
+        #[tokio::test]
+        async fn running_pipeline_with_wait_returns_the_completed_pipeline_after_two_polls() {
+            let server = server_listing("IN_PROGRESS").await;
+            Mock::given(method("GET"))
+                .and(path(POLL_PATH))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(pipeline_json("IN_PROGRESS")),
+                )
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(POLL_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pipeline_json("COMPLETED")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let pipeline = fetch(&server, true).await.unwrap();
+
+            assert_eq!(pipeline.state.name, PipelineStateName::Completed);
+        }
+
+        #[tokio::test]
+        async fn failing_poll_returns_an_error() {
+            let server = server_listing("IN_PROGRESS").await;
+            Mock::given(method("GET"))
+                .and(path(POLL_PATH))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let result = fetch(&server, true).await;
+
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("500"), "unexpected error: {error}");
+        }
     }
 }
