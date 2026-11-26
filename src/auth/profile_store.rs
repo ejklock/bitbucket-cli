@@ -317,11 +317,20 @@ fn restrict_dir(_path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn restrict_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    if path.exists() {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    // A chmod fails on a read-only mount even when the mode is already right.
+    if needs_restriction(metadata.permissions().mode()) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .context("Failed to restrict profile database file")?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn needs_restriction(mode: u32) -> bool {
+    mode & 0o777 != 0o600
 }
 
 #[cfg(not(unix))]
@@ -836,5 +845,82 @@ mod tests {
             PathBuf::from("/tmp/x.db")
         );
         assert!(db_path_from(Some("")).unwrap().ends_with("bitbucket.db"));
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_tightens_a_database_whose_mode_is_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        for loose in [0o644, 0o640, 0o700] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bitbucket.db");
+            std::fs::write(&path, b"").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(loose)).unwrap();
+
+            ProfileStore::open(&path, Some(Box::new(MemoryBackend::default()))).unwrap();
+
+            assert_eq!(mode_of(&path), 0o600, "starting mode {loose:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_a_new_database_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitbucket.db");
+        ProfileStore::open(&path, Some(Box::new(MemoryBackend::default()))).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_file_leaves_an_owner_only_file_untouched() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitbucket.db");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let stamp = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.ctime(), m.ctime_nsec())
+        };
+        let before = stamp(&path);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        restrict_file(&path).unwrap();
+
+        // A chmod bumps ctime even when the mode does not change.
+        assert_eq!(stamp(&path), before);
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_file_tightens_a_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitbucket.db");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_file(&path).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn needs_restriction_is_false_only_for_exactly_0600() {
+        assert!(!needs_restriction(0o600));
+        assert!(!needs_restriction(0o100600));
+        for mode in [0o644, 0o640, 0o700, 0o400, 0o660, 0o000] {
+            assert!(needs_restriction(mode), "mode {mode:o}");
+        }
     }
 }

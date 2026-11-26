@@ -149,7 +149,7 @@ pub struct Arguments {
     /// `KEY=value` secured variables of pipeline_trigger.
     #[serde(default)]
     pub secured_var: Vec<String>,
-    /// Wait for the pipeline to finish, for pipeline_trigger and pipeline_rerun.
+    /// Wait for the pipeline to finish, for pipeline_trigger, pipeline_rerun and pipeline_view.
     #[serde(default)]
     pub wait: bool,
 }
@@ -171,7 +171,9 @@ pub fn is_long_call(tool: ToolKind, arguments: &Arguments) -> bool {
     match (tool, arguments.operation.as_str()) {
         (ToolKind::Write, "pipeline_trigger" | "pipeline_rerun") => arguments.wait,
         (ToolKind::Read, "pr_pipelines") => true,
-        (ToolKind::Read, "pipeline_view") => arguments.logs || arguments.full_logs,
+        (ToolKind::Read, "pipeline_view") => {
+            arguments.logs || arguments.full_logs || arguments.wait
+        }
         (
             ToolKind::Read,
             "pr_list" | "pipeline_list" | "repo_list" | "pr_diffstat" | "pr_commits"
@@ -409,6 +411,7 @@ static OPERATIONS: LazyLock<Vec<(&str, Vec<Field>)>> = LazyLock::new(|| {
                 switch("logs", |a| a.logs),
                 text("step", |a| &a.step),
                 switch("full_logs", |a| a.full_logs),
+                wait(),
             ],
         ),
         (

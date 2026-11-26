@@ -350,6 +350,48 @@ fn wait_false_or_absent_adds_nothing_and_is_ignored_by_other_operations() {
     assert_eq!(read(&view).unwrap(), read(&pr("pr_view")).unwrap());
 }
 
+#[test]
+fn wait_on_pipeline_view_adds_the_switch_and_parses_in_the_cli() {
+    use crate::cli::pipeline::PipelineCommands;
+    let view = |wait| Arguments {
+        repo: Some("a/b".into()),
+        build: Some(4),
+        wait,
+        ..call("pipeline_view")
+    };
+    let argv = read(&view(true)).unwrap();
+    assert!(argv.contains(&"--wait".to_owned()), "{argv:?}");
+    match pipeline_commands(argv) {
+        PipelineCommands::View { wait, .. } => assert!(wait),
+        _ => panic!("not parsed as pipeline view"),
+    }
+    let argv = read(&view(false)).unwrap();
+    assert!(!argv.contains(&"--wait".to_owned()), "{argv:?}");
+    match pipeline_commands(argv) {
+        PipelineCommands::View { wait, .. } => assert!(!wait),
+        _ => panic!("not parsed as pipeline view"),
+    }
+}
+
+#[test]
+fn long_call_pipeline_view_is_long_when_waiting_or_reading_logs() {
+    let view = |logs, full_logs, wait| Arguments {
+        logs,
+        full_logs,
+        wait,
+        ..call("pipeline_view")
+    };
+    assert!(is_long_call(ToolKind::Read, &view(false, false, true)));
+    assert!(is_long_call(ToolKind::Read, &view(true, false, false)));
+    assert!(is_long_call(ToolKind::Read, &view(false, true, false)));
+    assert!(!is_long_call(ToolKind::Read, &view(false, false, false)));
+    let list = Arguments {
+        wait: true,
+        ..call("pipeline_list")
+    };
+    assert!(!is_long_call(ToolKind::Read, &list));
+}
+
 fn limited(operation: &str, limit: Option<u32>) -> Arguments {
     Arguments {
         limit,
@@ -474,9 +516,14 @@ fn schema_fields_are_split_between_the_tools() {
     for field in ["state", "logs", "scan_limit", "build"] {
         assert!(read.contains(field), "read lacks {field}");
     }
-    for field in ["title", "body", "wait"] {
+    for field in ["title", "body"] {
         assert!(!read.contains(field), "read has {field}");
     }
+    let wait = published(ToolKind::Read)
+        .into_iter()
+        .find(|(name, _)| name == "wait")
+        .map(|(_, property)| property["type"].clone());
+    assert_eq!(wait, Some(json!("boolean")));
     for field in ["title", "var", "wait", "uuid", "build"] {
         assert!(write.contains(field), "write lacks {field}");
     }
