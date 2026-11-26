@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-26
+
+### Added
+
+- `bitbucket pipeline view --wait` (`-w`) waits for a pipeline that is
+  already running until it is completed, halted or paused, then prints the
+  same view as without the flag. A pipeline already settled returns at once.
+- The MCP operation `pipeline_view` takes `wait`, so an agent can follow a
+  deploy in progress. The call runs as an MCP task when the client declares
+  the tasks extension.
+
+### Fixed
+
+- Commands no longer fail with "Failed to restrict profile database file"
+  when the profile database already has mode 0600 but sits on a read-only
+  filesystem, such as an agent sandbox. The database is chmodded only when
+  its mode is not 0600.
+
 ## [1.4.2] - 2026-11-25
 
 ### Added
