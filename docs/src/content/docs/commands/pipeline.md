@@ -22,7 +22,7 @@ The `bitbucket pipeline` command group drives Bitbucket Pipelines end to end —
 | `pipeline schedule` | Manage pipeline schedules |
 | `pipeline cache` | Manage pipeline dependency caches |
 
-The `list` command supports `--limit`, `--status`, `--target-branch`, `--sort`, and `--page` for filtering and paging. `view` requires `--build` and can show logs with `--logs`, a single step with `--step`, or complete logs with `--full-logs`. `trigger` runs a branch (`--branch`, default `main`), a specific `--commit`, or a custom `--pipeline`, passing `--var KEY=VALUE` and `--secured-var KEY=VALUE`, and can block with `--wait`. `stop` targets a build by `--build` or `--uuid`; `rerun` re-runs an existing `--build` and can also block with `--wait` (`-w`). `config` toggles pipelines with `--enable`/`--disable` or sets `--next-build-number`.
+The `list` command supports `--limit`, `--status`, `--target-branch`, `--sort`, and `--page` for filtering and paging. `view` requires `--build` and can show logs with `--logs`, a single step with `--step`, or complete logs with `--full-logs`. `view` can also block with `--wait` (`-w`) until a running pipeline settles. `trigger` runs a branch (`--branch`, default `main`), a specific `--commit`, or a custom `--pipeline`, passing `--var KEY=VALUE` and `--secured-var KEY=VALUE`, and can block with `--wait`. `stop` targets a build by `--build` or `--uuid`; `rerun` re-runs an existing `--build` and can also block with `--wait` (`-w`). `config` toggles pipelines with `--enable`/`--disable` or sets `--next-build-number`.
 
 ### `pipeline variable`
 
